@@ -368,7 +368,7 @@ impl TerminalTabState {
         root.set_vexpand(true);
         root.append(&build_terminal_split_widget_tree(&tree));
         let active_leaf_id = active_leaf_id.unwrap_or_else(|| tree.first_leaf().leaf_id.clone());
-        Self {
+        let state = Self {
             inner: Rc::new(TerminalTabInner {
                 tree: RefCell::new(tree),
                 active_leaf_id: RefCell::new(active_leaf_id),
@@ -376,7 +376,9 @@ impl TerminalTabState {
                 rebuild_source: RefCell::new(None),
                 focus_after_rebuild: Cell::new(false),
             }),
-        }
+        };
+        state.sync_split_dimming();
+        state
     }
     fn root(&self) -> gtk::Widget {
         self.inner.root.clone().upcast()
@@ -400,6 +402,7 @@ impl TerminalTabState {
         }
         drop(tree);
         *self.inner.active_leaf_id.borrow_mut() = leaf_id.to_string();
+        self.sync_split_dimming();
         true
     }
 
@@ -428,6 +431,16 @@ impl TerminalTabState {
             .tree
             .borrow()
             .for_each_leaf(|leaf| leaf.handle.refresh_display());
+    }
+
+    fn sync_split_dimming(&self) {
+        let tree = self.inner.tree.borrow();
+        let should_dim = tree.leaf_count() > 1;
+        let active_leaf_id = self.inner.active_leaf_id.borrow().clone();
+        tree.for_each_leaf(|leaf| {
+            leaf.handle
+                .set_split_dimmed(should_dim && leaf.leaf_id != active_leaf_id);
+        });
     }
 
     fn replace_callbacks(&self, mut build: impl FnMut(&TerminalLeafState) -> TerminalCallbacks) {
@@ -471,6 +484,7 @@ impl TerminalTabState {
         );
         if replaced {
             *self.inner.active_leaf_id.borrow_mut() = new_leaf.leaf_id;
+            self.sync_split_dimming();
             self.trigger_rebuild(true);
         }
         replaced
@@ -484,6 +498,7 @@ impl TerminalTabState {
         if removed {
             let next_leaf_id = self.inner.tree.borrow().first_leaf().leaf_id.clone();
             *self.inner.active_leaf_id.borrow_mut() = next_leaf_id;
+            self.sync_split_dimming();
             self.trigger_rebuild(true);
         }
         removed
@@ -557,6 +572,7 @@ fn build_terminal_split_widget_tree(node: &TerminalSplitNode) -> gtk::Widget {
                 .hexpand(true)
                 .vexpand(true)
                 .build();
+            paned.add_css_class(window::SPLIT_PANE_CSS_CLASS);
             paned.set_shrink_start_child(false);
             paned.set_shrink_end_child(false);
             paned.set_resize_start_child(true);

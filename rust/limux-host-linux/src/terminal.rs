@@ -181,6 +181,7 @@ thread_local! {
 pub struct TerminalHandle {
     surface_cell: Rc<RefCell<Option<ghostty_surface_t>>>,
     gl_area: gtk::GLArea,
+    split_dim_overlay: gtk::Widget,
     search_bar: gtk::SearchBar,
     search_entry: gtk::SearchEntry,
     callbacks: Rc<RefCell<TerminalCallbacks>>,
@@ -214,6 +215,10 @@ impl TerminalHandle {
         };
 
         refresh_realized_surface_display(surface, &self.gl_area);
+    }
+
+    pub fn set_split_dimmed(&self, dimmed: bool) {
+        self.split_dim_overlay.set_visible(dimmed);
     }
 
     pub fn perform_binding_action(&self, action: &str) -> bool {
@@ -1169,6 +1174,16 @@ pub fn create_terminal(
     overlay.set_child(Some(&gl_area));
     overlay.set_hexpand(true);
     overlay.set_vexpand(true);
+    let split_dim_overlay = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    split_dim_overlay.add_css_class("limux-terminal-split-dim");
+    split_dim_overlay.set_hexpand(true);
+    split_dim_overlay.set_vexpand(true);
+    split_dim_overlay.set_halign(gtk::Align::Fill);
+    split_dim_overlay.set_valign(gtk::Align::Fill);
+    split_dim_overlay.set_can_target(false);
+    split_dim_overlay.set_focusable(false);
+    split_dim_overlay.set_visible(false);
+    overlay.add_overlay(&split_dim_overlay);
 
     let scrollbar_adjustment = gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 0.0, 0.0);
     let scrollbar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&scrollbar_adjustment));
@@ -1204,6 +1219,7 @@ pub fn create_terminal(
     let handle = TerminalHandle {
         surface_cell: surface_cell.clone(),
         gl_area: gl_area.clone(),
+        split_dim_overlay: split_dim_overlay.upcast(),
         search_bar: search_bar.clone(),
         search_entry: search_entry.clone(),
         callbacks: callbacks.clone(),

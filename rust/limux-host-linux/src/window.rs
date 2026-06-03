@@ -1210,6 +1210,7 @@ const HOST_ENTRY_CSS_CLASS: &str = "limux-host-entry";
 const WORKSPACE_RENAME_ENTRY_CSS_CLASS: &str = "limux-ws-rename-entry";
 const WORKSPACE_RENAME_ENTRY_CSS_CLASSES: [&str; 2] =
     [HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS];
+pub(crate) const SPLIT_PANE_CSS_CLASS: &str = "limux-split-pane";
 const SIDEBAR_HANDLE_CSS_CLASS: &str = "limux-sidebar-handle";
 const SIDEBAR_HANDLE_CURSOR_NAME: &str = "col-resize";
 const SIDEBAR_RESIZE_HANDLE_WIDTH_PX: i32 = 3;
@@ -1383,6 +1384,17 @@ row:selected .limux-ws-path {
 }
 .limux-content {
     background-color: @window_bg_color;
+}
+.limux-terminal-split-dim {
+    background-color: alpha(@window_bg_color, 0.30);
+}
+.limux-split-pane > separator {
+    background-color: alpha(@window_fg_color, 0.16);
+    min-width: 2px;
+    min-height: 2px;
+}
+.limux-split-pane > separator:hover {
+    background-color: alpha(@window_fg_color, 0.24);
 }
 .limux-sidebar-handle {
     min-width: 3px;
@@ -6198,6 +6210,8 @@ mod tests {
         assert!(BASE_CSS.contains(".limux-host-entry"));
         assert!(BASE_CSS.contains(".limux-host-entry text"));
         assert!(BASE_CSS.contains(".limux-host-entry text placeholder"));
+        assert!(BASE_CSS.contains(".limux-terminal-split-dim"));
+        assert!(BASE_CSS.contains(".limux-split-pane > separator"));
         assert!(BASE_CSS.contains("caret-color: currentColor;"));
     }
 

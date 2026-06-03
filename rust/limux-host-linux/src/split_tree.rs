@@ -9,7 +9,7 @@ use crate::layout_state::{self, LayoutNodeState, PaneState, SplitOrientation, Sp
 use crate::pane;
 use crate::window::{
     apply_split_ratio_after_layout, attach_split_position_persistence, update_split_ratio_state,
-    State,
+    State, SPLIT_PANE_CSS_CLASS,
 };
 
 // ---------------------------------------------------------------------------
@@ -453,6 +453,7 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
                 .hexpand(true)
                 .vexpand(true)
                 .build();
+            paned.add_css_class(SPLIT_PANE_CSS_CLASS);
             paned.set_shrink_start_child(false);
             paned.set_shrink_end_child(false);
             paned.set_resize_start_child(true);
