@@ -1,6 +1,5 @@
 use std::collections::hash_map::Entry;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -191,6 +190,10 @@ pub enum TabContentState {
         cwd: Option<String>,
         #[serde(default)]
         agent: Option<RestorableAgentState>,
+        #[serde(default)]
+        tree: Option<Box<TerminalTreeState>>,
+        #[serde(default)]
+        active_leaf_id: Option<String>,
     },
     Browser {
         #[serde(default)]
@@ -198,6 +201,32 @@ pub enum TabContentState {
     },
     Keybinds {},
     Settings {},
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TerminalTreeState {
+    Leaf(TerminalLeafState),
+    Split(TerminalSplitState),
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct TerminalLeafState {
+    #[serde(default)]
+    pub leaf_id: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub agent: Option<RestorableAgentState>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct TerminalSplitState {
+    pub orientation: SplitOrientation,
+    #[serde(default = "default_split_ratio")]
+    pub ratio: f64,
+    pub start: Box<TerminalTreeState>,
+    pub end: Box<TerminalTreeState>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -260,6 +289,8 @@ impl TabState {
             content: TabContentState::Terminal {
                 cwd: cwd.map(|value| value.to_string()),
                 agent: None,
+                tree: Some(Box::new(TerminalTreeState::single_leaf(cwd, None))),
+                active_leaf_id: Some(default_terminal_leaf_id()),
             },
         }
     }
@@ -273,6 +304,106 @@ impl TabState {
                 uri: uri.map(|value| value.to_string()),
             },
         }
+    }
+}
+
+impl TerminalTreeState {
+    pub fn single_leaf(cwd: Option<&str>, agent: Option<RestorableAgentState>) -> Self {
+        Self::Leaf(TerminalLeafState {
+            leaf_id: Some(default_terminal_leaf_id()),
+            cwd: cwd.map(|value| value.to_string()),
+            agent,
+        })
+    }
+
+    fn first_leaf_id(&self) -> Option<String> {
+        match self {
+            Self::Leaf(leaf) => leaf
+                .leaf_id
+                .clone()
+                .or_else(|| Some(default_terminal_leaf_id())),
+            Self::Split(split) => split.start.first_leaf_id(),
+        }
+    }
+
+    fn active_leaf(&self, active_leaf_id: Option<&str>) -> Option<&TerminalLeafState> {
+        match self {
+            Self::Leaf(leaf) => Some(leaf),
+            Self::Split(split) => self
+                .find_leaf(active_leaf_id.unwrap_or_default())
+                .or_else(|| split.start.active_leaf(active_leaf_id))
+                .or_else(|| split.end.active_leaf(active_leaf_id)),
+        }
+    }
+
+    fn find_leaf(&self, leaf_id: &str) -> Option<&TerminalLeafState> {
+        match self {
+            Self::Leaf(leaf) => (leaf.leaf_id.as_deref() == Some(leaf_id)).then_some(leaf),
+            Self::Split(split) => split
+                .start
+                .find_leaf(leaf_id)
+                .or_else(|| split.end.find_leaf(leaf_id)),
+        }
+    }
+
+    fn for_each_leaf_mut(&mut self, visit: &mut dyn FnMut(&mut TerminalLeafState)) {
+        match self {
+            Self::Leaf(leaf) => visit(leaf),
+            Self::Split(split) => {
+                split.start.for_each_leaf_mut(visit);
+                split.end.for_each_leaf_mut(visit);
+            }
+        }
+    }
+
+    fn normalize(&mut self, seen_leaf_ids: &mut HashSet<String>) {
+        match self {
+            Self::Leaf(leaf) => {
+                let mut leaf_id = leaf
+                    .leaf_id
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(default_terminal_leaf_id);
+                ensure_unique_id(&mut leaf_id, seen_leaf_ids, "leaf");
+                leaf.leaf_id = Some(leaf_id);
+            }
+            Self::Split(split) => {
+                split.ratio = clamp_split_ratio(split.ratio);
+                split.start.normalize(seen_leaf_ids);
+                split.end.normalize(seen_leaf_ids);
+            }
+        }
+    }
+}
+
+fn ensure_unique_id(id: &mut String, seen: &mut HashSet<String>, fallback_prefix: &str) {
+    let base = id
+        .trim()
+        .split_once(':')
+        .map(|(_, tail)| tail)
+        .unwrap_or(id.trim())
+        .trim();
+    let base = if base.is_empty() {
+        fallback_prefix
+    } else {
+        base
+    };
+    if seen.insert(base.to_string()) {
+        *id = base.to_string();
+        return;
+    }
+    let prefix = base
+        .rsplit_once('-')
+        .and_then(|(prefix, suffix)| suffix.parse::<usize>().ok().map(|_| prefix))
+        .unwrap_or(base);
+    let mut next = 0;
+    loop {
+        let candidate = format!("{prefix}-{next}");
+        if seen.insert(candidate.clone()) {
+            *id = candidate;
+            return;
+        }
+        next += 1;
     }
 }
 
@@ -403,6 +534,38 @@ pub fn normalize_layout(layout: &mut LayoutNodeState, working_directory: Option<
             if pane.tabs.is_empty() {
                 *pane = PaneState::fallback(working_directory);
                 return;
+            }
+            let mut seen_tab_ids = HashSet::new();
+            for tab in &mut pane.tabs {
+                ensure_unique_id(&mut tab.id, &mut seen_tab_ids, "tab");
+                if let TabContentState::Terminal {
+                    cwd,
+                    agent,
+                    tree,
+                    active_leaf_id,
+                } = &mut tab.content
+                {
+                    if tree.is_none() {
+                        *tree = Some(Box::new(TerminalTreeState::single_leaf(
+                            cwd.as_deref().or(working_directory),
+                            agent.clone(),
+                        )));
+                    }
+                    if let Some(tree) = tree.as_deref_mut() {
+                        tree.normalize(&mut HashSet::new());
+                        if active_leaf_id.is_none()
+                            || tree
+                                .find_leaf(active_leaf_id.as_deref().unwrap_or_default())
+                                .is_none()
+                        {
+                            *active_leaf_id = tree.first_leaf_id();
+                        }
+                        if let Some(active_leaf) = tree.active_leaf(active_leaf_id.as_deref()) {
+                            *cwd = active_leaf.cwd.clone();
+                            *agent = active_leaf.agent.clone();
+                        }
+                    }
+                }
             }
             let mut active_exists = false;
             for tab in &pane.tabs {
@@ -581,8 +744,12 @@ impl RestorableAgentIndex {
         workspace_id: &str,
         pane_id: Option<u32>,
         tab_id: &str,
+        leaf_id: Option<&str>,
     ) -> Option<RestorableAgentState> {
-        let surface_id = pane_id.map(|pane_id| format!("{pane_id}:{tab_id}"));
+        let surface_id = pane_id.map(|pane_id| match leaf_id {
+            Some(leaf_id) if !leaf_id.is_empty() => format!("{pane_id}:{tab_id}:{leaf_id}"),
+            _ => format!("{pane_id}:{tab_id}"),
+        });
         surface_id
             .as_ref()
             .and_then(|surface_id| {
@@ -611,17 +778,46 @@ pub fn attach_restorable_agents_to_layout(
     match layout {
         LayoutNodeState::Pane(pane) => {
             for tab in &mut pane.tabs {
-                if let TabContentState::Terminal { agent, .. } = &mut tab.content {
-                    if agent
-                        .as_ref()
-                        .is_some_and(|agent| !agent.restore_on_startup)
-                    {
-                        continue;
-                    }
-                    if let Some(restored_agent) =
-                        index.agent_for_surface(workspace_id, pane.pane_id, &tab.id)
-                    {
-                        *agent = Some(restored_agent);
+                if let TabContentState::Terminal {
+                    agent,
+                    tree,
+                    active_leaf_id,
+                    ..
+                } = &mut tab.content
+                {
+                    if let Some(tree) = tree.as_deref_mut() {
+                        tree.for_each_leaf_mut(&mut |leaf| {
+                            if leaf
+                                .agent
+                                .as_ref()
+                                .is_some_and(|agent| !agent.restore_on_startup)
+                            {
+                                return;
+                            }
+                            if let Some(restored_agent) = index.agent_for_surface(
+                                workspace_id,
+                                pane.pane_id,
+                                &tab.id,
+                                leaf.leaf_id.as_deref(),
+                            ) {
+                                leaf.agent = Some(restored_agent);
+                            }
+                        });
+                        if let Some(active_leaf) = tree.active_leaf(active_leaf_id.as_deref()) {
+                            *agent = active_leaf.agent.clone();
+                        }
+                    } else {
+                        if agent
+                            .as_ref()
+                            .is_some_and(|agent| !agent.restore_on_startup)
+                        {
+                            continue;
+                        }
+                        if let Some(restored_agent) =
+                            index.agent_for_surface(workspace_id, pane.pane_id, &tab.id, None)
+                        {
+                            *agent = Some(restored_agent);
+                        }
                     }
                 }
             }
@@ -679,6 +875,10 @@ fn default_split_ratio() -> f64 {
 
 fn default_tab_id(prefix: &str) -> String {
     format!("{prefix}-0")
+}
+
+fn default_terminal_leaf_id() -> String {
+    "leaf-0".to_string()
 }
 
 fn build_resume_command(
@@ -1206,7 +1406,7 @@ mod tests {
         let index = RestorableAgentIndex::load_from_dir(dir.path());
 
         let agent = index
-            .agent_for_surface("new-workspace", Some(42), "tab-a")
+            .agent_for_surface("new-workspace", Some(42), "tab-a", None)
             .expect("agent by surface fallback");
         assert_eq!(agent.kind, RestorableAgentKind::Codex);
         assert_eq!(agent.session_id, "session-a");
@@ -1258,12 +1458,12 @@ mod tests {
 
         assert!(
             index
-                .agent_for_surface("workspace-c", Some(29), "terminal-0")
+                .agent_for_surface("workspace-c", Some(29), "terminal-0", None)
                 .is_none(),
             "duplicate surfaces across workspaces must not pick an unrelated latest session"
         );
         let exact_agent = index
-            .agent_for_surface("workspace-a", Some(29), "terminal-0")
+            .agent_for_surface("workspace-a", Some(29), "terminal-0", None)
             .expect("exact workspace/surface match");
         assert_eq!(exact_agent.session_id, "session-a");
     }
@@ -1298,7 +1498,7 @@ mod tests {
         let index = RestorableAgentIndex::load_from_dir(dir.path());
 
         let agent = index
-            .agent_for_surface("new-workspace", None, "tab-a")
+            .agent_for_surface("new-workspace", None, "tab-a", None)
             .expect("agent by tab id fallback");
         assert_eq!(agent.kind, RestorableAgentKind::Codex);
         assert_eq!(agent.session_id, "session-a");
@@ -1350,12 +1550,12 @@ mod tests {
 
         assert!(
             index
-                .agent_for_surface("workspace-c", None, "terminal-0")
+                .agent_for_surface("workspace-c", None, "terminal-0", None)
                 .is_none(),
             "duplicate tab ids must not pick an unrelated latest session"
         );
         let exact_agent = index
-            .agent_for_surface("workspace-a", Some(42), "terminal-0")
+            .agent_for_surface("workspace-a", Some(42), "terminal-0", None)
             .expect("exact surface match");
         assert_eq!(exact_agent.session_id, "session-a");
     }
@@ -1379,6 +1579,17 @@ mod tests {
                         launch_command: None,
                         restore_on_startup: true,
                     }),
+                    tree: Some(Box::new(TerminalTreeState::single_leaf(
+                        Some("/tmp/project"),
+                        Some(RestorableAgentState {
+                            kind: RestorableAgentKind::Codex,
+                            session_id: "persisted-session".to_string(),
+                            cwd: Some("/tmp/project".to_string()),
+                            launch_command: None,
+                            restore_on_startup: true,
+                        }),
+                    ))),
+                    active_leaf_id: Some(default_terminal_leaf_id()),
                 },
             }],
         });
@@ -1474,6 +1685,27 @@ mod tests {
                     }),
                     restore_on_startup: true,
                 }),
+                tree: Some(Box::new(TerminalTreeState::single_leaf(
+                    Some("/tmp/project"),
+                    Some(RestorableAgentState {
+                        kind: RestorableAgentKind::Codex,
+                        session_id: "sess-123".to_string(),
+                        cwd: Some("/tmp/project".to_string()),
+                        launch_command: Some(AgentLaunchCommandState {
+                            executable: "codex".to_string(),
+                            arguments: vec![
+                                "codex".to_string(),
+                                "--model".to_string(),
+                                "gpt-5.5".to_string(),
+                            ],
+                            cwd: Some("/tmp/project".to_string()),
+                            environment: Default::default(),
+                            captured_at: Some(12.0),
+                        }),
+                        restore_on_startup: true,
+                    }),
+                ))),
+                active_leaf_id: Some(default_terminal_leaf_id()),
             },
         };
 
@@ -1496,6 +1728,224 @@ mod tests {
             }
             other => panic!("expected terminal tab, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn normalize_layout_migrates_legacy_terminal_tab_to_tree() {
+        let mut layout = LayoutNodeState::Pane(PaneState {
+            pane_id: Some(7),
+            active_tab_id: Some("tab-a".to_string()),
+            tabs: vec![TabState {
+                id: "tab-a".to_string(),
+                custom_name: None,
+                pinned: false,
+                content: TabContentState::Terminal {
+                    cwd: Some("/tmp/project".to_string()),
+                    agent: None,
+                    tree: None,
+                    active_leaf_id: None,
+                },
+            }],
+        });
+
+        normalize_layout(&mut layout, None);
+
+        let LayoutNodeState::Pane(pane) = layout else {
+            panic!("expected pane");
+        };
+        match &pane.tabs[0].content {
+            TabContentState::Terminal {
+                tree,
+                active_leaf_id,
+                ..
+            } => {
+                assert_eq!(active_leaf_id.as_deref(), Some("leaf-0"));
+                let Some(tree) = tree else {
+                    panic!("expected single-leaf tree");
+                };
+                let TerminalTreeState::Leaf(leaf) = tree.as_ref() else {
+                    panic!("expected single-leaf tree");
+                };
+                assert_eq!(leaf.leaf_id.as_deref(), Some("leaf-0"));
+                assert_eq!(leaf.cwd.as_deref(), Some("/tmp/project"));
+            }
+            other => panic!("expected terminal tab, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_layout_dedupes_duplicate_tab_ids() {
+        let mut layout = LayoutNodeState::Pane(PaneState {
+            pane_id: Some(7),
+            active_tab_id: Some("terminal-0".to_string()),
+            tabs: vec![
+                TabState::terminal("terminal-0", Some("/tmp/project-a")),
+                TabState::terminal("terminal-0", Some("/tmp/project-b")),
+                TabState::browser("browser-0", Some("https://example.com")),
+                TabState::browser("browser-0", Some("https://example.org")),
+            ],
+        });
+
+        normalize_layout(&mut layout, None);
+
+        let LayoutNodeState::Pane(pane) = layout else {
+            panic!("expected pane");
+        };
+        assert_eq!(pane.active_tab_id.as_deref(), Some("terminal-0"));
+        assert_eq!(
+            pane.tabs
+                .iter()
+                .map(|tab| tab.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["terminal-0", "terminal-1", "browser-0", "browser-1"]
+        );
+    }
+
+    #[test]
+    fn normalize_layout_dedupes_duplicate_terminal_leaf_ids() {
+        let mut layout = LayoutNodeState::Pane(PaneState {
+            pane_id: Some(7),
+            active_tab_id: Some("tab-a".to_string()),
+            tabs: vec![TabState {
+                id: "tab-a".to_string(),
+                custom_name: None,
+                pinned: false,
+                content: TabContentState::Terminal {
+                    cwd: Some("/tmp/project-a".to_string()),
+                    agent: None,
+                    tree: Some(Box::new(TerminalTreeState::Split(TerminalSplitState {
+                        orientation: SplitOrientation::Horizontal,
+                        ratio: 0.5,
+                        start: Box::new(TerminalTreeState::Leaf(TerminalLeafState {
+                            leaf_id: None,
+                            cwd: Some("/tmp/project-a".to_string()),
+                            agent: None,
+                        })),
+                        end: Box::new(TerminalTreeState::Leaf(TerminalLeafState {
+                            leaf_id: Some("leaf-0".to_string()),
+                            cwd: Some("/tmp/project-b".to_string()),
+                            agent: None,
+                        })),
+                    }))),
+                    active_leaf_id: Some("leaf-0".to_string()),
+                },
+            }],
+        });
+
+        normalize_layout(&mut layout, None);
+
+        let LayoutNodeState::Pane(pane) = layout else {
+            panic!("expected pane");
+        };
+        let TabContentState::Terminal {
+            tree,
+            active_leaf_id,
+            cwd,
+            ..
+        } = &pane.tabs[0].content
+        else {
+            panic!("expected terminal tab");
+        };
+        let Some(tree) = tree else {
+            panic!("expected split tree");
+        };
+        let TerminalTreeState::Split(tree) = tree.as_ref() else {
+            panic!("expected split tree");
+        };
+        let TerminalTreeState::Leaf(start) = tree.start.as_ref() else {
+            panic!("expected first leaf");
+        };
+        let TerminalTreeState::Leaf(end) = tree.end.as_ref() else {
+            panic!("expected second leaf");
+        };
+        assert_eq!(start.leaf_id.as_deref(), Some("leaf-0"));
+        assert_eq!(end.leaf_id.as_deref(), Some("leaf-1"));
+        assert_eq!(active_leaf_id.as_deref(), Some("leaf-0"));
+        assert_eq!(cwd.as_deref(), Some("/tmp/project-a"));
+    }
+
+    #[test]
+    fn hook_index_attaches_agent_to_matching_leaf_surface() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("codex-hook-sessions.json"),
+            r#"{
+                "version": 1,
+                "sessions": {
+                    "session-a": {
+                        "session_id": "session-a",
+                        "workspace_id": "workspace-a",
+                        "surface_id": "42:tab-a:leaf-b",
+                        "cwd": "/tmp/project-b",
+                        "pid": 1,
+                        "launch_command": {
+                            "executable": "codex",
+                            "arguments": ["codex"],
+                            "cwd": "/tmp/project-b",
+                            "environment": {},
+                            "captured_at": 10.0
+                        },
+                        "updated_at": 10.0
+                    }
+                }
+            }"#,
+        )
+        .expect("write hook state");
+        let index = RestorableAgentIndex::load_from_dir(dir.path());
+        let mut layout = LayoutNodeState::Pane(PaneState {
+            pane_id: Some(42),
+            active_tab_id: Some("tab-a".to_string()),
+            tabs: vec![TabState {
+                id: "tab-a".to_string(),
+                custom_name: None,
+                pinned: false,
+                content: TabContentState::Terminal {
+                    cwd: Some("/tmp/project-a".to_string()),
+                    agent: None,
+                    tree: Some(Box::new(TerminalTreeState::Split(TerminalSplitState {
+                        orientation: SplitOrientation::Horizontal,
+                        ratio: 0.5,
+                        start: Box::new(TerminalTreeState::Leaf(TerminalLeafState {
+                            leaf_id: Some("leaf-a".to_string()),
+                            cwd: Some("/tmp/project-a".to_string()),
+                            agent: None,
+                        })),
+                        end: Box::new(TerminalTreeState::Leaf(TerminalLeafState {
+                            leaf_id: Some("leaf-b".to_string()),
+                            cwd: Some("/tmp/project-b".to_string()),
+                            agent: None,
+                        })),
+                    }))),
+                    active_leaf_id: Some("leaf-b".to_string()),
+                },
+            }],
+        });
+
+        attach_restorable_agents_to_layout(&mut layout, "workspace-a", &index);
+
+        let LayoutNodeState::Pane(pane) = layout else {
+            panic!("expected pane");
+        };
+        let TabContentState::Terminal { tree, agent, .. } = &pane.tabs[0].content else {
+            panic!("expected terminal tab");
+        };
+        let Some(tree) = tree else {
+            panic!("expected split tree");
+        };
+        let TerminalTreeState::Split(tree) = tree.as_ref() else {
+            panic!("expected split tree");
+        };
+        let TerminalTreeState::Leaf(leaf) = tree.end.as_ref() else {
+            panic!("expected second leaf");
+        };
+        assert_eq!(
+            leaf.agent.as_ref().map(|agent| agent.session_id.as_str()),
+            Some("session-a")
+        );
+        assert_eq!(
+            agent.as_ref().map(|agent| agent.session_id.as_str()),
+            Some("session-a")
+        );
     }
 
     #[test]

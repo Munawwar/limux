@@ -428,7 +428,12 @@ fn resolve_pane_create_source_id(
         let requested = normalize_surface_handle(surface_id);
         return surface_to_pane
             .iter()
-            .find(|(known_surface_id, _)| *known_surface_id == requested)
+            .find(|(known_surface_id, _)| {
+                *known_surface_id == requested
+                    || known_surface_id
+                        .strip_prefix(requested)
+                        .is_some_and(|suffix| suffix.starts_with(':'))
+            })
             .map(|(_, pane_id)| *pane_id)
             .ok_or_else(|| PaneCreateTargetError::InvalidSurfaceId(surface_id.to_string()));
     }
@@ -703,7 +708,15 @@ fn surface_health_payload(
     let requested = surface_hint.map(normalize_surface_handle);
     let surfaces = pane::surface_summaries_for_root(&workspace.root)
         .into_iter()
-        .filter(|surface| requested.is_none_or(|requested| surface.surface_id == requested))
+        .filter(|surface| {
+            requested.is_none_or(|requested| {
+                surface.surface_id == requested
+                    || surface
+                        .surface_id
+                        .strip_prefix(requested)
+                        .is_some_and(|suffix| suffix.starts_with(':'))
+            })
+        })
         .enumerate()
         .map(|(index, surface)| surface_health_row(state, workspace, index, surface))
         .collect::<Vec<_>>();
@@ -1032,6 +1045,8 @@ fn split_ratio_state(paned: &gtk::Paned) -> Option<Rc<RefCell<f64>>> {
     }
 }
 
+type SplitRatioRestoreScheduler = dyn Fn(&gtk::Paned, &Rc<RefCell<f64>>, &Rc<Cell<bool>>) + 'static;
+
 pub(crate) fn update_split_ratio_state(paned: &gtk::Paned, ratio: f64) {
     let ratio = layout_state::clamp_split_ratio(ratio);
     if let Some(stored_ratio) = split_ratio_state(paned) {
@@ -1062,12 +1077,7 @@ fn build_workspace_root(
     (root, container)
 }
 
-fn apply_ratio_value(
-    paned: &gtk::Paned,
-    orientation: gtk::Orientation,
-    ratio: f64,
-    applying: &Rc<Cell<bool>>,
-) -> bool {
+fn apply_ratio_value(paned: &gtk::Paned, orientation: gtk::Orientation, ratio: f64) -> bool {
     let ratio = layout_state::clamp_split_ratio(ratio);
     let allocation = paned.allocation();
     let size = if orientation == gtk::Orientation::Horizontal {
@@ -1078,10 +1088,8 @@ fn apply_ratio_value(
     if size <= 0 {
         return false;
     }
-    applying.set(true);
     paned.set_position(layout_state::split_position_from_ratio(ratio, size));
     update_split_ratio_state(paned, ratio);
-    applying.set(false);
     true
 }
 
@@ -1091,34 +1099,93 @@ pub(crate) fn apply_split_ratio_after_layout(
     ratio_cell: Rc<RefCell<f64>>,
     applying: Rc<Cell<bool>>,
 ) {
-    // Capture the ratio by value for the initial idle callback so that early
-    // position_notify events (which may corrupt the cell) don't affect it.
-    let initial_ratio = *ratio_cell.borrow();
+    let restore_epoch = Rc::new(Cell::new(0u64));
+    let schedule_restore: Rc<SplitRatioRestoreScheduler> =
+        Rc::new(move |paned, ratio_cell, applying| {
+            let epoch = restore_epoch.get().wrapping_add(1);
+            restore_epoch.set(epoch);
+            applying.set(true);
 
-    let paned_for_idle = paned.clone();
-    let applying_for_idle = applying.clone();
-    glib::idle_add_local_once(move || {
-        apply_ratio_value(
-            &paned_for_idle,
-            orientation,
-            initial_ratio,
-            &applying_for_idle,
-        );
-    });
+            let attempts = Rc::new(Cell::new(0usize));
+            let last_size = Rc::new(Cell::new(-1));
+            let settled_frames = Rc::new(Cell::new(0usize));
+            let paned = paned.clone();
+            let ratio_cell = ratio_cell.clone();
+            let applying = applying.clone();
+            let restore_epoch = restore_epoch.clone();
+            let attempts_for_tick = attempts.clone();
+            let last_size_for_tick = last_size.clone();
+            let settled_frames_for_tick = settled_frames.clone();
+
+            paned.add_tick_callback(move |paned, _| {
+                if restore_epoch.get() != epoch {
+                    return glib::ControlFlow::Break;
+                }
+
+                attempts_for_tick.set(attempts_for_tick.get() + 1);
+                let ratio = layout_state::clamp_split_ratio(*ratio_cell.borrow());
+                let allocation = paned.allocation();
+                let size = if orientation == gtk::Orientation::Horizontal {
+                    allocation.width()
+                } else {
+                    allocation.height()
+                };
+                if size <= 0 {
+                    last_size_for_tick.set(-1);
+                    settled_frames_for_tick.set(0);
+                } else {
+                    let target = layout_state::split_position_from_ratio(ratio, size);
+                    if paned.position() != target {
+                        apply_ratio_value(paned, orientation, ratio);
+                        settled_frames_for_tick.set(0);
+                    } else {
+                        update_split_ratio_state(paned, ratio);
+                        settled_frames_for_tick.set(if last_size_for_tick.get() == size {
+                            settled_frames_for_tick.get() + 1
+                        } else {
+                            1
+                        });
+                    }
+                    last_size_for_tick.set(size);
+                    if settled_frames_for_tick.get() >= 2 {
+                        applying.set(false);
+                        return glib::ControlFlow::Break;
+                    }
+                }
+
+                if attempts_for_tick.get() >= 120 {
+                    applying.set(false);
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+        });
+
+    schedule_restore(paned, &ratio_cell, &applying);
 
     let paned_for_map = paned.clone();
+    let ratio_cell_for_map = ratio_cell.clone();
+    let applying_for_map = applying.clone();
+    let schedule_restore_for_map = schedule_restore.clone();
     // Re-apply the current data model ratio on every map event (workspace switches).
     // Reads from the cell so drag-adjusted ratios are restored correctly.
     paned.connect_map(move |_| {
-        let ratio = *ratio_cell.borrow();
-        apply_ratio_value(&paned_for_map, orientation, ratio, &applying);
+        schedule_restore_for_map(&paned_for_map, &ratio_cell_for_map, &applying_for_map);
     });
 }
 
-pub(crate) fn attach_split_position_persistence(state: &State, paned: &gtk::Paned) {
+pub(crate) fn attach_split_position_persistence(
+    state: &State,
+    paned: &gtk::Paned,
+    applying: Rc<Cell<bool>>,
+) {
     update_split_ratio_state(paned, layout_state::DEFAULT_SPLIT_RATIO);
     let state = state.clone();
     paned.connect_position_notify(move |paned| {
+        if applying.get() {
+            return;
+        }
         let allocation = paned.allocation();
         let size = if paned.orientation() == gtk::Orientation::Horizontal {
             allocation.width()

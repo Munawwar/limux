@@ -1091,11 +1091,14 @@ pub struct TerminalCallbacks {
     pub on_pwd_changed: Box<PwdChangedCallback>,
     pub on_desktop_notification: Box<DesktopNotificationCallback>,
     pub on_bell: Box<BellCallback>,
+    pub on_focus: Box<VoidCallback>,
     pub on_close: Box<VoidCallback>,
     pub on_open_url: Box<OpenUrlCallback>,
     pub on_open_browser_here: Box<VoidCallback>,
     pub on_split_right: Box<VoidCallback>,
     pub on_split_down: Box<VoidCallback>,
+    pub on_split_within_right: Box<VoidCallback>,
+    pub on_split_within_down: Box<VoidCallback>,
     pub on_open_keybinds: Box<WidgetCallback>,
     pub identity: Box<IdentityCallback>,
 }
@@ -1744,6 +1747,7 @@ pub fn create_terminal(
         let had_focus_leave = had_focus.clone();
         let im_context_enter = im_context.clone();
         let im_context_leave = im_context.clone();
+        let callbacks_for_focus = callbacks.clone();
         let focus_ctrl = gtk::EventControllerFocus::new();
         let sc = surface_cell.clone();
         focus_ctrl.connect_enter(move |_| {
@@ -1752,6 +1756,7 @@ pub fn create_terminal(
             if let Some(surface) = *sc.borrow() {
                 unsafe { ghostty_surface_set_focus(surface, true) };
             }
+            (callbacks_for_focus.borrow().on_focus)();
         });
         focus_ctrl.connect_leave(move |_| {
             had_focus_leave.set(false);
@@ -1900,6 +1905,8 @@ fn show_terminal_context_menu(
         ("Browser", true),
         ("Split Right", true),
         ("Split Down", true),
+        ("Split Within Right", true),
+        ("Split Within Down", true),
         ("Keybinds", true),
         ("---", false),
         ("Clear", true),
@@ -1994,6 +2001,14 @@ fn show_terminal_context_menu(
                     "Split Down" => {
                         let callbacks = cb.borrow();
                         (callbacks.on_split_down)();
+                    }
+                    "Split Within Right" => {
+                        let callbacks = cb.borrow();
+                        (callbacks.on_split_within_right)();
+                    }
+                    "Split Within Down" => {
+                        let callbacks = cb.borrow();
+                        (callbacks.on_split_within_down)();
                     }
                     "Keybinds" => {
                         let anchor: gtk::Widget = gl_area.clone().upcast();

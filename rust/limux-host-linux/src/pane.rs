@@ -18,11 +18,12 @@ use webkit6::prelude::*;
 use crate::app_config::AppConfig;
 use crate::keybind_editor;
 use crate::layout_state::{
-    PaneState, RestorableAgentState, TabContentState, TabState as SavedTabState,
+    self, PaneState, RestorableAgentState, TabContentState, TabState as SavedTabState,
 };
 use crate::settings_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
 use crate::terminal::{self, TerminalCallbacks};
+use crate::window;
 
 static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -229,8 +230,405 @@ pub struct PaneCallbacks {
 
 #[derive(Clone)]
 struct TerminalTabState {
+    inner: Rc<TerminalTabInner>,
+}
+
+struct TerminalTabInner {
+    tree: RefCell<TerminalSplitNode>,
+    active_leaf_id: RefCell<String>,
+    root: gtk::Box,
+    rebuild_source: RefCell<Option<glib::SourceId>>,
+    focus_after_rebuild: Cell<bool>,
+}
+
+#[derive(Clone)]
+struct TerminalLeafState {
+    leaf_id: String,
     cwd: Rc<RefCell<Option<String>>>,
+    agent: Rc<RefCell<Option<RestorableAgentState>>>,
     handle: terminal::TerminalHandle,
+    widget: gtk::Widget,
+}
+
+#[derive(Clone)]
+enum TerminalSplitNode {
+    Leaf(TerminalLeafState),
+    Split {
+        orientation: gtk::Orientation,
+        ratio: Rc<RefCell<f64>>,
+        start: Box<TerminalSplitNode>,
+        end: Box<TerminalSplitNode>,
+    },
+}
+
+impl TerminalSplitNode {
+    fn first_leaf(&self) -> &TerminalLeafState {
+        match self {
+            Self::Leaf(leaf) => leaf,
+            Self::Split { start, .. } => start.first_leaf(),
+        }
+    }
+
+    fn find_leaf(&self, leaf_id: &str) -> Option<&TerminalLeafState> {
+        match self {
+            Self::Leaf(leaf) => (leaf.leaf_id == leaf_id).then_some(leaf),
+            Self::Split { start, end, .. } => {
+                start.find_leaf(leaf_id).or_else(|| end.find_leaf(leaf_id))
+            }
+        }
+    }
+
+    fn for_each_leaf(&self, mut visit: impl FnMut(&TerminalLeafState)) {
+        fn walk(node: &TerminalSplitNode, visit: &mut dyn FnMut(&TerminalLeafState)) {
+            match node {
+                TerminalSplitNode::Leaf(leaf) => visit(leaf),
+                TerminalSplitNode::Split { start, end, .. } => {
+                    walk(start, visit);
+                    walk(end, visit);
+                }
+            }
+        }
+
+        walk(self, &mut visit);
+    }
+
+    fn leaf_count(&self) -> usize {
+        match self {
+            Self::Leaf(_) => 1,
+            Self::Split { start, end, .. } => start.leaf_count() + end.leaf_count(),
+        }
+    }
+
+    fn replace_leaf(&mut self, leaf_id: &str, replacement: TerminalSplitNode) -> bool {
+        match self {
+            Self::Leaf(leaf) => {
+                if leaf.leaf_id == leaf_id {
+                    *self = replacement;
+                    true
+                } else {
+                    false
+                }
+            }
+            Self::Split { start, end, .. } => {
+                start.replace_leaf(leaf_id, replacement.clone())
+                    || end.replace_leaf(leaf_id, replacement)
+            }
+        }
+    }
+
+    fn remove_leaf(&mut self, leaf_id: &str) -> bool {
+        match self {
+            Self::Leaf(_) => false,
+            Self::Split { start, end, .. } => {
+                if matches!(start.as_ref(), Self::Leaf(leaf) if leaf.leaf_id == leaf_id) {
+                    *self = std::mem::replace(end.as_mut(), Self::Leaf(start.first_leaf().clone()));
+                    return true;
+                }
+                if matches!(end.as_ref(), Self::Leaf(leaf) if leaf.leaf_id == leaf_id) {
+                    *self = std::mem::replace(start.as_mut(), Self::Leaf(end.first_leaf().clone()));
+                    return true;
+                }
+                start.remove_leaf(leaf_id) || end.remove_leaf(leaf_id)
+            }
+        }
+    }
+
+    fn snapshot(&self) -> layout_state::TerminalTreeState {
+        match self {
+            Self::Leaf(leaf) => {
+                layout_state::TerminalTreeState::Leaf(layout_state::TerminalLeafState {
+                    leaf_id: Some(leaf.leaf_id.clone()),
+                    cwd: leaf.cwd.borrow().clone(),
+                    agent: leaf.agent.borrow().clone(),
+                })
+            }
+            Self::Split {
+                orientation,
+                ratio,
+                start,
+                end,
+            } => layout_state::TerminalTreeState::Split(layout_state::TerminalSplitState {
+                orientation: if *orientation == gtk::Orientation::Horizontal {
+                    layout_state::SplitOrientation::Horizontal
+                } else {
+                    layout_state::SplitOrientation::Vertical
+                },
+                ratio: *ratio.borrow(),
+                start: Box::new(start.snapshot()),
+                end: Box::new(end.snapshot()),
+            }),
+        }
+    }
+}
+
+impl TerminalTabState {
+    fn from_tree(tree: TerminalSplitNode, active_leaf_id: Option<String>) -> Self {
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.set_hexpand(true);
+        root.set_vexpand(true);
+        root.append(&build_terminal_split_widget_tree(&tree));
+        let active_leaf_id = active_leaf_id.unwrap_or_else(|| tree.first_leaf().leaf_id.clone());
+        Self {
+            inner: Rc::new(TerminalTabInner {
+                tree: RefCell::new(tree),
+                active_leaf_id: RefCell::new(active_leaf_id),
+                root,
+                rebuild_source: RefCell::new(None),
+                focus_after_rebuild: Cell::new(false),
+            }),
+        }
+    }
+    fn root(&self) -> gtk::Widget {
+        self.inner.root.clone().upcast()
+    }
+
+    fn active_leaf(&self) -> TerminalLeafState {
+        let tree = self.inner.tree.borrow();
+        tree.find_leaf(&self.inner.active_leaf_id.borrow())
+            .cloned()
+            .unwrap_or_else(|| tree.first_leaf().clone())
+    }
+
+    fn active_leaf_id(&self) -> String {
+        self.active_leaf().leaf_id
+    }
+
+    fn set_active_leaf(&self, leaf_id: &str) -> bool {
+        let tree = self.inner.tree.borrow();
+        if tree.find_leaf(leaf_id).is_none() || *self.inner.active_leaf_id.borrow() == leaf_id {
+            return false;
+        }
+        drop(tree);
+        *self.inner.active_leaf_id.borrow_mut() = leaf_id.to_string();
+        true
+    }
+
+    fn active_handle(&self) -> terminal::TerminalHandle {
+        self.active_leaf().handle
+    }
+
+    fn has_leaf(&self, leaf_id: &str) -> bool {
+        self.inner.tree.borrow().find_leaf(leaf_id).is_some()
+    }
+
+    fn active_cwd(&self) -> Option<String> {
+        self.active_leaf().cwd.borrow().clone()
+    }
+
+    fn active_agent(&self) -> Option<RestorableAgentState> {
+        self.active_leaf().agent.borrow().clone()
+    }
+
+    fn leaf_count(&self) -> usize {
+        self.inner.tree.borrow().leaf_count()
+    }
+
+    fn refresh_display(&self) {
+        self.inner
+            .tree
+            .borrow()
+            .for_each_leaf(|leaf| leaf.handle.refresh_display());
+    }
+
+    fn replace_callbacks(&self, mut build: impl FnMut(&TerminalLeafState) -> TerminalCallbacks) {
+        self.inner.tree.borrow().for_each_leaf(|leaf| {
+            leaf.handle.replace_callbacks(build(leaf));
+        });
+    }
+
+    fn snapshot_tree(&self) -> layout_state::TerminalTreeState {
+        self.inner.tree.borrow().snapshot()
+    }
+
+    fn split_leaf(
+        &self,
+        leaf_id: &str,
+        new_leaf: TerminalLeafState,
+        orientation: gtk::Orientation,
+        new_leaf_first: bool,
+    ) -> bool {
+        let Some(target_leaf) = self.inner.tree.borrow().find_leaf(leaf_id).cloned() else {
+            return false;
+        };
+        let ratio = Rc::new(RefCell::new(layout_state::DEFAULT_SPLIT_RATIO));
+        let replaced = self.inner.tree.borrow_mut().replace_leaf(
+            leaf_id,
+            if new_leaf_first {
+                TerminalSplitNode::Split {
+                    orientation,
+                    ratio,
+                    start: Box::new(TerminalSplitNode::Leaf(new_leaf.clone())),
+                    end: Box::new(TerminalSplitNode::Leaf(target_leaf)),
+                }
+            } else {
+                TerminalSplitNode::Split {
+                    orientation,
+                    ratio,
+                    start: Box::new(TerminalSplitNode::Leaf(target_leaf)),
+                    end: Box::new(TerminalSplitNode::Leaf(new_leaf.clone())),
+                }
+            },
+        );
+        if replaced {
+            *self.inner.active_leaf_id.borrow_mut() = new_leaf.leaf_id;
+            self.trigger_rebuild(true);
+        }
+        replaced
+    }
+
+    fn close_leaf(&self, leaf_id: &str) -> bool {
+        if self.inner.tree.borrow().leaf_count() <= 1 {
+            return false;
+        }
+        let removed = self.inner.tree.borrow_mut().remove_leaf(leaf_id);
+        if removed {
+            let next_leaf_id = self.inner.tree.borrow().first_leaf().leaf_id.clone();
+            *self.inner.active_leaf_id.borrow_mut() = next_leaf_id;
+            self.trigger_rebuild(true);
+        }
+        removed
+    }
+
+    fn trigger_rebuild(&self, focus_after_rebuild: bool) {
+        self.inner.focus_after_rebuild.set(focus_after_rebuild);
+        if let Some(source) = self.inner.rebuild_source.borrow_mut().take() {
+            source.remove();
+        }
+        while let Some(child) = self.inner.root.first_child() {
+            self.inner.root.remove(&child);
+        }
+        self.schedule_rebuild();
+    }
+
+    fn schedule_rebuild(&self) {
+        if self.inner.rebuild_source.borrow().is_some() {
+            return;
+        }
+        let state = self.clone();
+        let source = glib::idle_add_local_once(move || {
+            state.inner.rebuild_source.replace(None);
+            state.do_rebuild();
+        });
+        self.inner.rebuild_source.replace(Some(source));
+    }
+
+    fn do_rebuild(&self) {
+        let tree = self.inner.tree.borrow();
+        if terminal_tree_has_widget_parents(&tree) {
+            detach_terminal_tree_widgets(&tree);
+            drop(tree);
+            self.schedule_rebuild();
+            return;
+        }
+        self.inner
+            .root
+            .append(&build_terminal_split_widget_tree(&tree));
+        drop(tree);
+        self.refresh_display();
+        if self.inner.focus_after_rebuild.replace(false) {
+            let handle = self.active_handle();
+            glib::idle_add_local_once(move || {
+                handle.focus_surface();
+            });
+        }
+    }
+}
+
+impl Drop for TerminalTabInner {
+    fn drop(&mut self) {
+        if let Some(source) = self.rebuild_source.borrow_mut().take() {
+            source.remove();
+        }
+    }
+}
+
+fn build_terminal_split_widget_tree(node: &TerminalSplitNode) -> gtk::Widget {
+    match node {
+        TerminalSplitNode::Leaf(leaf) => leaf.widget.clone(),
+        TerminalSplitNode::Split {
+            orientation,
+            ratio,
+            start,
+            end,
+        } => {
+            let split_orientation = *orientation;
+            let paned = gtk::Paned::builder()
+                .orientation(split_orientation)
+                .hexpand(true)
+                .vexpand(true)
+                .build();
+            paned.set_shrink_start_child(false);
+            paned.set_shrink_end_child(false);
+            paned.set_resize_start_child(true);
+            paned.set_resize_end_child(true);
+
+            // Ignore early position-notify churn until the first restored ratio
+            // has actually been applied with a real allocation.
+            let applying = Rc::new(Cell::new(true));
+            let shared_ratio = ratio.clone();
+            let orientation_for_notify = *orientation;
+            let applying_for_notify = applying.clone();
+            paned.connect_position_notify(move |paned| {
+                if applying_for_notify.get() {
+                    return;
+                }
+                let allocation = paned.allocation();
+                let size = if orientation_for_notify == gtk::Orientation::Horizontal {
+                    allocation.width()
+                } else {
+                    allocation.height()
+                };
+                let stored_ratio = *shared_ratio.borrow();
+                *shared_ratio.borrow_mut() =
+                    layout_state::snapshot_split_ratio(paned.position(), size, Some(stored_ratio));
+            });
+
+            paned.set_start_child(Some(&build_terminal_split_widget_tree(start)));
+            paned.set_end_child(Some(&build_terminal_split_widget_tree(end)));
+            window::apply_split_ratio_after_layout(
+                &paned,
+                split_orientation,
+                ratio.clone(),
+                applying,
+            );
+            paned.upcast()
+        }
+    }
+}
+
+fn terminal_tree_has_widget_parents(node: &TerminalSplitNode) -> bool {
+    match node {
+        TerminalSplitNode::Leaf(leaf) => leaf.widget.parent().is_some(),
+        TerminalSplitNode::Split { start, end, .. } => {
+            terminal_tree_has_widget_parents(start) || terminal_tree_has_widget_parents(end)
+        }
+    }
+}
+
+fn detach_terminal_tree_widgets(node: &TerminalSplitNode) {
+    match node {
+        TerminalSplitNode::Leaf(leaf) => {
+            if let Some(parent) = leaf.widget.parent() {
+                if let Some(paned) = parent.downcast_ref::<gtk::Paned>() {
+                    if paned
+                        .start_child()
+                        .map(|child| child == leaf.widget)
+                        .unwrap_or(false)
+                    {
+                        paned.set_start_child(gtk::Widget::NONE);
+                    } else {
+                        paned.set_end_child(gtk::Widget::NONE);
+                    }
+                } else if let Some(container) = parent.downcast_ref::<gtk::Box>() {
+                    container.remove(&leaf.widget);
+                }
+            }
+        }
+        TerminalSplitNode::Split { start, end, .. } => {
+            detach_terminal_tree_widgets(start);
+            detach_terminal_tree_widgets(end);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -691,7 +1089,7 @@ pub fn refresh_terminal_displays_in_root(root: &gtk::Widget) {
     for internals in pane_internals_for_root(root) {
         for entry in &internals.tab_state.borrow().tabs {
             if let TabKind::Terminal { state } = &entry.kind {
-                state.handle.refresh_display();
+                state.refresh_display();
             }
         }
     }
@@ -731,9 +1129,15 @@ fn composite_surface_id(pane_id: u32, tab_id: &str) -> String {
     format!("{pane_id}:{tab_id}")
 }
 
-fn surface_hint_matches(surface_id: &str, tab_id: &str, surface_hint: &str) -> bool {
+fn surface_hint_matches(
+    surface_id: &str,
+    tab_surface_id: &str,
+    tab_id: &str,
+    surface_hint: &str,
+) -> bool {
     let requested = normalize_surface_hint(surface_hint);
-    !requested.is_empty() && (requested == tab_id || requested == surface_id)
+    !requested.is_empty()
+        && (requested == tab_id || requested == tab_surface_id || requested == surface_id)
 }
 
 pub fn terminal_handle_for_surface(
@@ -753,19 +1157,25 @@ pub fn terminal_handle_for_surface(
         let TabKind::Terminal { state } = &entry.kind else {
             continue;
         };
-
-        let full_surface_id = composite_surface_id(pane_id, &entry.id);
-
-        if requested.is_some_and(|value| value == entry.id || value == full_surface_id) {
-            return Some((full_surface_id, state.handle.clone()));
-        }
-
-        if active_tab == Some(entry.id.as_str()) {
-            return Some((full_surface_id, state.handle.clone()));
-        }
-
-        if fallback.is_none() {
-            fallback = Some((full_surface_id, state.handle.clone()));
+        let tab_surface_id = composite_surface_id(pane_id, &entry.id);
+        let active_leaf_id = state.active_leaf_id();
+        let mut matched = None;
+        state.inner.tree.borrow().for_each_leaf(|leaf| {
+            let surface_id = terminal_surface_id(pane_id, &entry.id, &leaf.leaf_id);
+            if requested.is_some_and(|value| {
+                value == surface_id || value == tab_surface_id || value == entry.id
+            }) {
+                matched = Some((surface_id, leaf.handle.clone()));
+                return;
+            }
+            if active_tab == Some(entry.id.as_str()) && leaf.leaf_id == active_leaf_id {
+                matched = Some((surface_id, leaf.handle.clone()));
+            } else if fallback.is_none() {
+                fallback = Some((surface_id, leaf.handle.clone()));
+            }
+        });
+        if let Some(matched) = matched {
+            return Some(matched);
         }
     }
 
@@ -784,10 +1194,16 @@ pub fn exact_terminal_handle_for_surface(
         let TabKind::Terminal { state } = &entry.kind else {
             continue;
         };
-
-        let full_surface_id = composite_surface_id(pane_id, &entry.id);
-        if surface_hint_matches(&full_surface_id, &entry.id, surface_hint) {
-            return Some((full_surface_id, state.handle.clone()));
+        let tab_surface_id = composite_surface_id(pane_id, &entry.id);
+        let mut matched = None;
+        state.inner.tree.borrow().for_each_leaf(|leaf| {
+            let surface_id = terminal_surface_id(pane_id, &entry.id, &leaf.leaf_id);
+            if surface_hint_matches(&surface_id, &tab_surface_id, &entry.id, surface_hint) {
+                matched = Some((surface_id, leaf.handle.clone()));
+            }
+        });
+        if let Some(matched) = matched {
+            return Some(matched);
         }
     }
 
@@ -814,7 +1230,7 @@ enum TabFocusTarget {
 impl TabFocusTarget {
     fn from_entry(entry: &TabEntry) -> Self {
         match &entry.kind {
-            TabKind::Terminal { state } => Self::Terminal(state.handle.clone()),
+            TabKind::Terminal { state } => Self::Terminal(state.active_handle()),
             TabKind::Browser { state } => Self::Browser(state.handles.clone()),
             TabKind::Keybinds => Self::Widget(entry.content.clone()),
         }
@@ -943,6 +1359,8 @@ struct TerminalTabOptions<'a> {
     pinned: bool,
     cwd: Option<&'a str>,
     agent: Option<RestorableAgentState>,
+    tree: Option<&'a layout_state::TerminalTreeState>,
+    active_leaf_id: Option<&'a str>,
 }
 
 struct BrowserTabOptions<'a> {
@@ -976,7 +1394,12 @@ fn restore_tabs_from_state(
 
     for saved_tab in &saved_state.tabs {
         match &saved_tab.content {
-            TabContentState::Terminal { cwd, agent } => add_terminal_tab_inner(
+            TabContentState::Terminal {
+                cwd,
+                agent,
+                tree,
+                active_leaf_id,
+            } => add_terminal_tab_inner(
                 internals,
                 cwd.as_deref().or(working_directory),
                 Some(TerminalTabOptions {
@@ -985,6 +1408,8 @@ fn restore_tabs_from_state(
                     pinned: saved_tab.pinned,
                     cwd: cwd.as_deref().or(working_directory),
                     agent: agent.clone(),
+                    tree: tree.as_deref(),
+                    active_leaf_id: active_leaf_id.as_deref(),
                 }),
             ),
             TabContentState::Browser { uri } => add_browser_tab_inner(
@@ -1048,14 +1473,187 @@ fn restore_tabs_from_state(
     }
 }
 
-fn make_terminal_callbacks(
+fn next_leaf_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn terminal_surface_id(pane_id: u32, tab_id: &str, leaf_id: &str) -> String {
+    format!("{pane_id}:{tab_id}:{leaf_id}")
+}
+
+fn placeholder_terminal_callbacks() -> TerminalCallbacks {
+    TerminalCallbacks {
+        on_title_changed: Box::new(|_| {}),
+        on_pwd_changed: Box::new(|_| {}),
+        on_desktop_notification: Box::new(|_, _, _| {}),
+        on_bell: Box::new(|_| {}),
+        on_focus: Box::new(|| {}),
+        on_close: Box::new(|| {}),
+        on_open_url: Box::new(|_, _| {}),
+        on_open_browser_here: Box::new(|| {}),
+        on_split_right: Box::new(|| {}),
+        on_split_down: Box::new(|| {}),
+        on_split_within_right: Box::new(|| {}),
+        on_split_within_down: Box::new(|| {}),
+        on_open_keybinds: Box::new(|_| {}),
+        identity: Box::new(|| terminal::TerminalIdentity {
+            workspace_id: None,
+            surface_id: String::new(),
+        }),
+    }
+}
+
+fn build_terminal_extra_env(
     internals: &Rc<PaneInternals>,
     tab_id: &str,
+    leaf_id: &str,
+) -> Vec<(String, String)> {
+    let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
+    let workspace_id = (internals.callbacks.workspace_for_pane)(&pane_widget);
+    let mut extra_env = Vec::new();
+    if let Some(workspace_id) = workspace_id {
+        extra_env.push(("LIMUX_WORKSPACE_ID".to_string(), workspace_id));
+    }
+    extra_env.push((
+        "LIMUX_SURFACE_ID".to_string(),
+        terminal_surface_id(internals.pane_id, tab_id, leaf_id),
+    ));
+    extra_env.push(("LIMUX_PANE_ID".to_string(), internals.pane_id.to_string()));
+    extra_env.push(("LIMUX_TAB_ID".to_string(), tab_id.to_string()));
+    if let Some(sock) = limux_control::socket_path::resolve_socket_path(
+        None,
+        limux_control::socket_path::SocketMode::Runtime,
+    )
+    .to_str()
+    {
+        extra_env.push(("LIMUX_SOCKET".to_string(), sock.to_string()));
+    }
+    extra_env
+}
+
+fn create_terminal_leaf(
+    internals: &Rc<PaneInternals>,
+    tab_id: &str,
+    leaf_id: &str,
+    working_directory: Option<&str>,
+    cwd: Option<&str>,
+    agent: Option<RestorableAgentState>,
+) -> TerminalLeafState {
+    let term_cwd = Rc::new(RefCell::new(
+        cwd.map(|cwd| cwd.to_string())
+            .or_else(|| working_directory.map(|cwd| cwd.to_string())),
+    ));
+    let term_agent = Rc::new(RefCell::new(agent.clone()));
+    let hover_focus = {
+        let callbacks = internals.callbacks.clone();
+        Rc::new(move || {
+            let config = (callbacks.current_config)();
+            let hover_focus = config.borrow().focus.hover_terminal_focus;
+            hover_focus
+        })
+    };
+    let startup_command = agent.as_ref().and_then(|agent| agent.resume_command());
+    if let Some(command) = startup_command.as_deref() {
+        eprintln!(
+            "limux: restoring agent terminal surface={} command={}",
+            terminal_surface_id(internals.pane_id, tab_id, leaf_id),
+            command
+        );
+    }
+    let term = terminal::create_terminal(
+        working_directory,
+        terminal::TerminalOptions {
+            hover_focus,
+            saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
+            startup_command,
+            extra_env: build_terminal_extra_env(internals, tab_id, leaf_id),
+        },
+        placeholder_terminal_callbacks(),
+    );
+    TerminalLeafState {
+        leaf_id: leaf_id.to_string(),
+        cwd: term_cwd,
+        agent: term_agent,
+        handle: term.handle,
+        widget: term.root,
+    }
+}
+
+fn runtime_terminal_tree_from_layout(
+    internals: &Rc<PaneInternals>,
+    tab_id: &str,
+    working_directory: Option<&str>,
+    tree: &layout_state::TerminalTreeState,
+) -> TerminalSplitNode {
+    match tree {
+        layout_state::TerminalTreeState::Leaf(leaf) => {
+            TerminalSplitNode::Leaf(create_terminal_leaf(
+                internals,
+                tab_id,
+                leaf.leaf_id.as_deref().unwrap_or("leaf-0"),
+                working_directory,
+                leaf.cwd.as_deref().or(working_directory),
+                leaf.agent.clone(),
+            ))
+        }
+        layout_state::TerminalTreeState::Split(split) => TerminalSplitNode::Split {
+            orientation: if split.orientation == layout_state::SplitOrientation::Horizontal {
+                gtk::Orientation::Horizontal
+            } else {
+                gtk::Orientation::Vertical
+            },
+            ratio: Rc::new(RefCell::new(layout_state::clamp_split_ratio(split.ratio))),
+            start: Box::new(runtime_terminal_tree_from_layout(
+                internals,
+                tab_id,
+                working_directory,
+                &split.start,
+            )),
+            end: Box::new(runtime_terminal_tree_from_layout(
+                internals,
+                tab_id,
+                working_directory,
+                &split.end,
+            )),
+        },
+    }
+}
+
+fn split_terminal_tab_leaf(
+    internals: &Rc<PaneInternals>,
+    terminal_tab_state: &TerminalTabState,
+    tab_id: &str,
     title_label: &gtk::Label,
-    term_cwd: &Rc<RefCell<Option<String>>>,
+    source_leaf: &TerminalLeafState,
+    orientation: gtk::Orientation,
+) {
+    let new_leaf = create_terminal_leaf(
+        internals,
+        tab_id,
+        &next_leaf_id(),
+        source_leaf.cwd.borrow().as_deref(),
+        source_leaf.cwd.borrow().as_deref(),
+        None,
+    );
+    if terminal_tab_state.split_leaf(&source_leaf.leaf_id, new_leaf, orientation, false) {
+        let state = terminal_tab_state.clone();
+        terminal_tab_state.replace_callbacks(|leaf| {
+            make_terminal_callbacks(internals, &state, tab_id, title_label, leaf)
+        });
+        (internals.callbacks.on_state_changed)();
+    }
+}
+
+fn make_terminal_callbacks(
+    internals: &Rc<PaneInternals>,
+    terminal_tab_state: &TerminalTabState,
+    tab_id: &str,
+    title_label: &gtk::Label,
+    leaf: &TerminalLeafState,
 ) -> TerminalCallbacks {
     let tid_for_title = tab_id.to_string();
-    let title_label = title_label.clone();
+    let leaf_id = leaf.leaf_id.clone();
+    let title_label_for_title = title_label.clone();
     let state_for_title = internals.tab_state.clone();
     let callbacks_for_bell = internals.callbacks.clone();
     let callbacks_for_pwd = internals.callbacks.clone();
@@ -1069,10 +1667,15 @@ fn make_terminal_callbacks(
     let content_stack = internals.content_stack.clone();
     let tab_state = internals.tab_state.clone();
     let pane_outer = internals.pane_outer.clone();
-    let term_cwd_for_pwd = term_cwd.clone();
+    let term_cwd_for_pwd = leaf.cwd.clone();
     let tid_for_close = tab_id.to_string();
     let tid_for_notification = tab_id.to_string();
     let pane_id = internals.pane_id;
+    let terminal_tab_state_for_focus = terminal_tab_state.clone();
+    let terminal_tab_state_for_close = terminal_tab_state.clone();
+    let terminal_tab_state_for_within_right = terminal_tab_state.clone();
+    let terminal_tab_state_for_within_down = terminal_tab_state.clone();
+    let source_leaf_for_within = leaf.clone();
 
     TerminalCallbacks {
         on_title_changed: Box::new(move |title: &str| {
@@ -1089,12 +1692,21 @@ fn make_terminal_callbacks(
             } else {
                 title.to_string()
             };
-            title_label.set_label(&display);
+            title_label_for_title.set_label(&display);
         }),
         on_pwd_changed: Box::new(move |pwd: &str| {
             *term_cwd_for_pwd.borrow_mut() = Some(pwd.to_string());
             (callbacks_for_pwd.on_pwd_changed)(pwd);
             (callbacks_for_pwd.on_state_changed)();
+        }),
+        on_focus: Box::new({
+            let callbacks = internals.callbacks.clone();
+            let leaf_id = leaf_id.clone();
+            move || {
+                if terminal_tab_state_for_focus.set_active_leaf(&leaf_id) {
+                    (callbacks.on_state_changed)();
+                }
+            }
         }),
         on_desktop_notification: Box::new({
             let callbacks = internals.callbacks.clone();
@@ -1116,7 +1728,16 @@ fn make_terminal_callbacks(
             let callbacks = callbacks_for_close.clone();
             let pane_outer = pane_outer.clone();
             let tab_id = tid_for_close.clone();
+            let terminal_tab_state = terminal_tab_state_for_close.clone();
+            let leaf_id = leaf_id.clone();
             glib::idle_add_local_once(move || {
+                if !terminal_tab_state.has_leaf(&leaf_id) {
+                    return;
+                }
+                if terminal_tab_state.close_leaf(&leaf_id) {
+                    (callbacks.on_state_changed)();
+                    return;
+                }
                 remove_tab(
                     &tab_strip,
                     &content_stack,
@@ -1161,6 +1782,52 @@ fn make_terminal_callbacks(
                 (callbacks_for_split_down.on_split)(&pane_widget, gtk::Orientation::Vertical);
             }
         }),
+        on_split_within_right: Box::new({
+            let internals = internals.clone();
+            let title_label = title_label.clone();
+            let tab_id = tab_id.to_string();
+            let source_leaf = source_leaf_for_within.clone();
+            move || {
+                let internals = internals.clone();
+                let terminal_tab_state = terminal_tab_state_for_within_right.clone();
+                let tab_id = tab_id.clone();
+                let title_label = title_label.clone();
+                let source_leaf = source_leaf.clone();
+                glib::idle_add_local_once(move || {
+                    split_terminal_tab_leaf(
+                        &internals,
+                        &terminal_tab_state,
+                        &tab_id,
+                        &title_label,
+                        &source_leaf,
+                        gtk::Orientation::Horizontal,
+                    );
+                });
+            }
+        }),
+        on_split_within_down: Box::new({
+            let internals = internals.clone();
+            let title_label = title_label.clone();
+            let tab_id = tab_id.to_string();
+            let source_leaf = leaf.clone();
+            move || {
+                let internals = internals.clone();
+                let terminal_tab_state = terminal_tab_state_for_within_down.clone();
+                let tab_id = tab_id.clone();
+                let title_label = title_label.clone();
+                let source_leaf = source_leaf.clone();
+                glib::idle_add_local_once(move || {
+                    split_terminal_tab_leaf(
+                        &internals,
+                        &terminal_tab_state,
+                        &tab_id,
+                        &title_label,
+                        &source_leaf,
+                        gtk::Orientation::Vertical,
+                    );
+                });
+            }
+        }),
         on_open_keybinds: Box::new({
             let pane_outer = internals.pane_outer.clone();
             move |_anchor| {
@@ -1170,7 +1837,7 @@ fn make_terminal_callbacks(
         }),
         identity: Box::new({
             let pane_outer = internals.pane_outer.clone();
-            let surface_id = format!("{}:{}", internals.pane_id, tab_id);
+            let surface_id = terminal_surface_id(internals.pane_id, tab_id, &leaf.leaf_id);
             move || {
                 let pane_widget: gtk::Widget = pane_outer.clone().upcast();
                 terminal::TerminalIdentity {
@@ -1200,66 +1867,34 @@ fn add_terminal_tab_inner(
         .and_then(|value| value.id.map(|id| id.to_string()))
         .unwrap_or_else(next_tab_id);
     let (tab_btn, title_label) = build_tab_button("Terminal", &tab_id, internals);
-
-    let term_cwd = Rc::new(RefCell::new(
+    let tree = options
+        .as_ref()
+        .and_then(|value| value.tree)
+        .map(|tree| runtime_terminal_tree_from_layout(internals, &tab_id, working_directory, tree))
+        .unwrap_or_else(|| {
+            TerminalSplitNode::Leaf(create_terminal_leaf(
+                internals,
+                &tab_id,
+                "leaf-0",
+                working_directory,
+                options
+                    .as_ref()
+                    .and_then(|value| value.cwd)
+                    .or(working_directory),
+                options.as_ref().and_then(|value| value.agent.clone()),
+            ))
+        });
+    let state = TerminalTabState::from_tree(
+        tree,
         options
             .as_ref()
-            .and_then(|value| value.cwd.map(|cwd| cwd.to_string()))
-            .or_else(|| working_directory.map(|cwd| cwd.to_string())),
-    ));
-    let term_callbacks = make_terminal_callbacks(internals, &tab_id, &title_label, &term_cwd);
-    let hover_focus = {
-        let callbacks = internals.callbacks.clone();
-        Rc::new(move || {
-            let config = (callbacks.current_config)();
-            let hover_focus = config.borrow().focus.hover_terminal_focus;
-            hover_focus
-        })
-    };
-
-    // Build the env the spawned shell will see. Encodes this terminal's
-    // identity so CLI calls (e.g. `limux identify`, `limux send`) auto-target
-    // the current surface without flags. Mirrors cmux's env auto-wiring.
-    let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
-    let workspace_id_for_env = (internals.callbacks.workspace_for_pane)(&pane_widget);
-    let surface_id_for_env = format!("{}:{}", internals.pane_id, tab_id);
-    let mut extra_env: Vec<(String, String)> = Vec::new();
-    if let Some(ws) = workspace_id_for_env {
-        extra_env.push(("LIMUX_WORKSPACE_ID".to_string(), ws));
-    }
-    extra_env.push(("LIMUX_SURFACE_ID".to_string(), surface_id_for_env));
-    extra_env.push(("LIMUX_PANE_ID".to_string(), internals.pane_id.to_string()));
-    extra_env.push(("LIMUX_TAB_ID".to_string(), tab_id.clone()));
-    if let Some(sock) = limux_control::socket_path::resolve_socket_path(
-        None,
-        limux_control::socket_path::SocketMode::Runtime,
-    )
-    .to_str()
-    {
-        extra_env.push(("LIMUX_SOCKET".to_string(), sock.to_string()));
-    }
-    let startup_command = options
-        .as_ref()
-        .and_then(|value| value.agent.as_ref())
-        .and_then(|agent| agent.resume_command());
-    if let Some(command) = startup_command.as_deref() {
-        eprintln!(
-            "limux: restoring agent terminal surface={}:{} command={}",
-            internals.pane_id, tab_id, command
-        );
-    }
-
-    let term = terminal::create_terminal(
-        working_directory,
-        terminal::TerminalOptions {
-            hover_focus,
-            saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
-            startup_command,
-            extra_env,
-        },
-        term_callbacks,
+            .and_then(|value| value.active_leaf_id.map(|value| value.to_string())),
     );
-    let widget = term.root.clone();
+    let callback_state = state.clone();
+    state.replace_callbacks(|leaf| {
+        make_terminal_callbacks(internals, &callback_state, &tab_id, &title_label, leaf)
+    });
+    let widget = state.root();
     internals.content_stack.add_named(&widget, Some(&tab_id));
 
     {
@@ -1274,10 +1909,7 @@ fn add_terminal_tab_inner(
                 .and_then(|value| value.custom_name.map(|name| name.to_string())),
             pinned: options.as_ref().map(|value| value.pinned).unwrap_or(false),
             kind: TabKind::Terminal {
-                state: TerminalTabState {
-                    cwd: term_cwd.clone(),
-                    handle: term.handle.clone(),
-                },
+                state: state.clone(),
             },
         });
     }
@@ -1313,7 +1945,7 @@ fn add_terminal_tab_inner(
         &internals.tab_state,
         &tab_id,
     );
-    term.handle.focus_surface();
+    state.active_handle().focus_surface();
     if options.is_none() {
         (internals.callbacks.on_state_changed)();
     }
@@ -1574,8 +2206,10 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
         .map(|entry| {
             let content = match &entry.kind {
                 TabKind::Terminal { state } => TabContentState::Terminal {
-                    cwd: state.cwd.borrow().clone(),
-                    agent: None,
+                    cwd: state.active_cwd(),
+                    agent: state.active_agent(),
+                    tree: Some(Box::new(state.snapshot_tree())),
+                    active_leaf_id: Some(state.active_leaf_id()),
                 },
                 TabKind::Browser { state } => TabContentState::Browser {
                     uri: state.uri.borrow().clone(),
@@ -1634,7 +2268,7 @@ pub fn tab_working_directory(pane_widget: &gtk::Widget, tab_id: &str) -> Option<
     let tab_state = internals.tab_state.borrow();
     let entry = tab_state.tabs.iter().find(|entry| entry.id == tab_id)?;
     match &entry.kind {
-        TabKind::Terminal { state } => state.cwd.borrow().clone(),
+        TabKind::Terminal { state } => state.active_cwd(),
         TabKind::Browser { .. } | TabKind::Keybinds => None,
     }
 }
@@ -1676,19 +2310,44 @@ pub fn pane_summaries_for_root(root: &gtk::Widget) -> Vec<PaneSummary> {
         .map(|internals| {
             let pane_id = internals.pane_id;
             let tab_state = internals.tab_state.borrow();
+            let surface_count = tab_state
+                .tabs
+                .iter()
+                .map(|entry| match &entry.kind {
+                    TabKind::Terminal { state } => state.leaf_count(),
+                    TabKind::Browser { .. } | TabKind::Keybinds => 1,
+                })
+                .sum();
             let active_surface_id = tab_state
                 .active_tab
                 .as_deref()
-                .map(|tab_id| composite_surface_id(pane_id, tab_id))
-                .or_else(|| {
+                .and_then(|tab_id| {
                     tab_state
                         .tabs
-                        .first()
-                        .map(|entry| composite_surface_id(pane_id, &entry.id))
+                        .iter()
+                        .find(|entry| entry.id == tab_id)
+                        .map(|entry| match &entry.kind {
+                            TabKind::Terminal { state } => {
+                                terminal_surface_id(pane_id, &entry.id, &state.active_leaf_id())
+                            }
+                            TabKind::Browser { .. } | TabKind::Keybinds => {
+                                composite_surface_id(pane_id, &entry.id)
+                            }
+                        })
+                })
+                .or_else(|| {
+                    tab_state.tabs.first().map(|entry| match &entry.kind {
+                        TabKind::Terminal { state } => {
+                            terminal_surface_id(pane_id, &entry.id, &state.active_leaf_id())
+                        }
+                        TabKind::Browser { .. } | TabKind::Keybinds => {
+                            composite_surface_id(pane_id, &entry.id)
+                        }
+                    })
                 });
             PaneSummary {
                 pane_id,
-                surface_count: tab_state.tabs.len(),
+                surface_count,
                 active_surface_id,
             }
         })
@@ -1711,7 +2370,7 @@ pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
         let tab_state = internals.tab_state.borrow();
         let active_tab = tab_state.active_tab.as_deref();
         for entry in &tab_state.tabs {
-            let selected = active_tab
+            let tab_selected = active_tab
                 .map(|current| current == entry.id)
                 .unwrap_or_else(|| {
                     tab_state
@@ -1719,24 +2378,44 @@ pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
                         .first()
                         .is_some_and(|first| first.id == entry.id)
                 });
-            let (kind, cwd, uri) = match &entry.kind {
+            match &entry.kind {
                 TabKind::Terminal { state } => {
-                    ("terminal".to_string(), state.cwd.borrow().clone(), None)
+                    let active_leaf_id = state.active_leaf_id();
+                    state.inner.tree.borrow().for_each_leaf(|leaf| {
+                        surfaces.push(SurfaceSummary {
+                            pane_id,
+                            surface_id: terminal_surface_id(pane_id, &entry.id, &leaf.leaf_id),
+                            title: entry.title_label.label().to_string(),
+                            kind: "terminal".to_string(),
+                            selected: tab_selected && leaf.leaf_id == active_leaf_id,
+                            cwd: leaf.cwd.borrow().clone(),
+                            uri: None,
+                        });
+                    });
                 }
                 TabKind::Browser { state } => {
-                    ("browser".to_string(), None, state.uri.borrow().clone())
+                    surfaces.push(SurfaceSummary {
+                        pane_id,
+                        surface_id: composite_surface_id(pane_id, &entry.id),
+                        title: entry.title_label.label().to_string(),
+                        kind: "browser".to_string(),
+                        selected: tab_selected,
+                        cwd: None,
+                        uri: state.uri.borrow().clone(),
+                    });
                 }
-                TabKind::Keybinds => ("keybinds".to_string(), None, None),
-            };
-            surfaces.push(SurfaceSummary {
-                pane_id,
-                surface_id: composite_surface_id(pane_id, &entry.id),
-                title: entry.title_label.label().to_string(),
-                kind,
-                selected,
-                cwd,
-                uri,
-            });
+                TabKind::Keybinds => {
+                    surfaces.push(SurfaceSummary {
+                        pane_id,
+                        surface_id: composite_surface_id(pane_id, &entry.id),
+                        title: entry.title_label.label().to_string(),
+                        kind: "keybinds".to_string(),
+                        selected: tab_selected,
+                        cwd: None,
+                        uri: None,
+                    });
+                }
+            }
         }
     }
 
@@ -1758,19 +2437,34 @@ pub fn active_surface_summary(pane_widget: &gtk::Widget) -> Option<SurfaceSummar
         .clone()
         .or_else(|| tab_state.tabs.first().map(|entry| entry.id.clone()))?;
     let entry = tab_state.tabs.iter().find(|entry| entry.id == active_id)?;
-    let (kind, cwd, uri) = match &entry.kind {
-        TabKind::Terminal { state } => ("terminal".to_string(), state.cwd.borrow().clone(), None),
-        TabKind::Browser { state } => ("browser".to_string(), None, state.uri.borrow().clone()),
-        TabKind::Keybinds => ("keybinds".to_string(), None, None),
-    };
-    Some(SurfaceSummary {
-        pane_id,
-        surface_id: composite_surface_id(pane_id, &entry.id),
-        title: entry.title_label.label().to_string(),
-        kind,
-        selected: true,
-        cwd,
-        uri,
+    Some(match &entry.kind {
+        TabKind::Terminal { state } => SurfaceSummary {
+            pane_id,
+            surface_id: terminal_surface_id(pane_id, &entry.id, &state.active_leaf_id()),
+            title: entry.title_label.label().to_string(),
+            kind: "terminal".to_string(),
+            selected: true,
+            cwd: state.active_cwd(),
+            uri: None,
+        },
+        TabKind::Browser { state } => SurfaceSummary {
+            pane_id,
+            surface_id: composite_surface_id(pane_id, &entry.id),
+            title: entry.title_label.label().to_string(),
+            kind: "browser".to_string(),
+            selected: true,
+            cwd: None,
+            uri: state.uri.borrow().clone(),
+        },
+        TabKind::Keybinds => SurfaceSummary {
+            pane_id,
+            surface_id: composite_surface_id(pane_id, &entry.id),
+            title: entry.title_label.label().to_string(),
+            kind: "keybinds".to_string(),
+            selected: true,
+            cwd: None,
+            uri: None,
+        },
     })
 }
 
@@ -1785,16 +2479,8 @@ pub fn terminal_handle_for_root(
     if let Some(requested) = requested {
         for internals in pane_internals_for_root(root) {
             let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
-            if let Some((surface_id, handle)) =
-                terminal_handle_for_surface(&pane_widget, Some(requested))
-            {
-                if surface_id == requested
-                    || surface_id
-                        .strip_prefix("surface:")
-                        .is_some_and(|value| value == requested)
-                {
-                    return Some((surface_id, handle));
-                }
+            if let Some(found) = terminal_handle_for_surface(&pane_widget, Some(requested)) {
+                return Some(found);
             }
         }
         return None;
@@ -1838,7 +2524,7 @@ pub fn focused_shortcut_target(pane_widget: &gtk::Widget) -> FocusedShortcutTarg
                 kind: TabKind::Terminal { state },
                 ..
             }) => FocusedShortcutTarget::Terminal(TerminalShortcutTarget {
-                handle: state.handle.clone(),
+                handle: state.active_handle(),
             }),
             Some(TabEntry {
                 kind: TabKind::Browser { state },
@@ -2396,12 +3082,10 @@ fn rebuild_tab_strip(tab_strip: &gtk::Box, tab_state: &Rc<RefCell<TabState>>) {
 
 fn rebind_moved_tab_entry(entry: &mut TabEntry, target: &Rc<PaneInternals>) {
     if let TabKind::Terminal { state } = &entry.kind {
-        state.handle.replace_callbacks(make_terminal_callbacks(
-            target,
-            &entry.id,
-            &entry.title_label,
-            &state.cwd,
-        ));
+        let callback_state = state.clone();
+        state.replace_callbacks(|leaf| {
+            make_terminal_callbacks(target, &callback_state, &entry.id, &entry.title_label, leaf)
+        });
     }
     entry.tab_button = build_tab_button_from_label(&entry.title_label, &entry.id, target);
     if entry.pinned {
@@ -3540,13 +4224,35 @@ mod tests {
     #[test]
     fn surface_hint_matches_only_exact_surface_or_tab_id() {
         assert!(surface_hint_matches(
+            "42:tab-a:leaf-0",
             "42:tab-a",
             "tab-a",
-            "surface:42:tab-a"
+            "surface:42:tab-a:leaf-0"
         ));
-        assert!(surface_hint_matches("42:tab-a", "tab-a", "tab-a"));
-        assert!(!surface_hint_matches("42:tab-a", "tab-a", "42:tab-b"));
-        assert!(!surface_hint_matches("42:tab-a", "tab-a", ""));
+        assert!(surface_hint_matches(
+            "42:tab-a:leaf-0",
+            "42:tab-a",
+            "tab-a",
+            "42:tab-a"
+        ));
+        assert!(surface_hint_matches(
+            "42:tab-a:leaf-0",
+            "42:tab-a",
+            "tab-a",
+            "tab-a"
+        ));
+        assert!(!surface_hint_matches(
+            "42:tab-a:leaf-0",
+            "42:tab-a",
+            "tab-a",
+            "42:tab-b"
+        ));
+        assert!(!surface_hint_matches(
+            "42:tab-a:leaf-0",
+            "42:tab-a",
+            "tab-a",
+            ""
+        ));
     }
 
     #[test]
