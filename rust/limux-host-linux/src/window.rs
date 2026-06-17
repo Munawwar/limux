@@ -63,6 +63,47 @@ struct Workspace {
     path_label: gtk::Label,
 }
 
+const WINDOW_CLOSE_BUTTON_CANCEL: i32 = 0;
+const WINDOW_CLOSE_BUTTON_CONFIRM: i32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowCloseAction {
+    Proceed,
+    Confirm,
+    Ignore,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WindowCloseState {
+    confirmed: bool,
+    dialog_open: bool,
+}
+
+impl WindowCloseState {
+    fn request(&mut self) -> WindowCloseAction {
+        if self.confirmed {
+            WindowCloseAction::Proceed
+        } else if self.dialog_open {
+            WindowCloseAction::Ignore
+        } else {
+            self.dialog_open = true;
+            WindowCloseAction::Confirm
+        }
+    }
+
+    fn resolve(&mut self, response: i32) -> bool {
+        *self = window_close_state_from_response(response);
+        self.confirmed
+    }
+}
+
+fn window_close_state_from_response(response: i32) -> WindowCloseState {
+    WindowCloseState {
+        confirmed: response == WINDOW_CLOSE_BUTTON_CONFIRM,
+        dialog_open: false,
+    }
+}
+
 pub(crate) struct AppState {
     app: adw::Application,
     window: adw::ApplicationWindow,
@@ -85,6 +126,7 @@ pub(crate) struct AppState {
     save_queued: bool,
     workspace_dragging: Option<String>,
     desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
+    window_close: WindowCloseState,
     _theme_portal_signal: Option<gio::SignalSubscription>,
     _theme_gnome_settings: Option<gio::Settings>,
     _theme_gnome_signal: Option<glib::SignalHandlerId>,
@@ -1628,6 +1670,7 @@ pub fn build_window(app: &adw::Application) {
         save_queued: false,
         workspace_dragging: None,
         desktop_notification_routes: HashMap::new(),
+        window_close: WindowCloseState::default(),
         _theme_portal_signal: None,
         _theme_gnome_settings: None,
         _theme_gnome_signal: None,
@@ -1767,11 +1810,21 @@ pub fn build_window(app: &adw::Application) {
     {
         let state = state.clone();
         window.connect_close_request(move |_| {
-            save_session_now(&state);
-            CONTROL_STATE.with(|slot| {
-                slot.borrow_mut().take();
-            });
-            glib::Propagation::Proceed
+            let action = { state.borrow_mut().window_close.request() };
+            match action {
+                WindowCloseAction::Proceed => {
+                    save_session_now(&state);
+                    CONTROL_STATE.with(|slot| {
+                        slot.borrow_mut().take();
+                    });
+                    glib::Propagation::Proceed
+                }
+                WindowCloseAction::Confirm => {
+                    request_window_close_confirmation(&state);
+                    glib::Propagation::Stop
+                }
+                WindowCloseAction::Ignore => glib::Propagation::Stop,
+            }
         });
     }
 
@@ -2145,7 +2198,8 @@ fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
             true
         }
         ShortcutCommand::QuitApp => {
-            quit_app(state);
+            let window = state.borrow().window.clone();
+            window.close();
             true
         }
         ShortcutCommand::NewInstance => spawn_new_instance(state),
@@ -5306,9 +5360,34 @@ fn show_runtime_error(state: &State, title: &str, detail: &str) {
     dialog.show(Some(&window));
 }
 
-fn quit_app(state: &State) {
-    save_session_now(state);
-    state.borrow().app.quit();
+fn request_window_close_confirmation(state: &State) {
+    let window = {
+        let s = state.borrow();
+        if s.window_close.confirmed || !s.window_close.dialog_open {
+            return;
+        }
+        s.window.clone()
+    };
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message("Close Limux?")
+        .detail("Your current session will be saved before the window closes.")
+        .build();
+    dialog.set_buttons(&["Don't Close", "Close"]);
+    dialog.set_default_button(WINDOW_CLOSE_BUTTON_CANCEL);
+    dialog.set_cancel_button(WINDOW_CLOSE_BUTTON_CANCEL);
+
+    let state = state.clone();
+    dialog.choose(Some(&window), None::<&gio::Cancellable>, move |response| {
+        let should_close = response.ok().is_some_and(|button| {
+            let mut s = state.borrow_mut();
+            s.window_close.resolve(button)
+        });
+        if should_close {
+            let window = state.borrow().window.clone();
+            window.close();
+        }
+    });
 }
 
 fn spawn_new_instance(state: &State) -> bool {
@@ -5990,11 +6069,13 @@ mod tests {
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation,
         should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
-        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
-        workspace_folder_path_from_input, workspace_notification_message, Direction,
-        EditableCaptureContext, NeighborScore, PaneBounds, PaneCreateDirection,
-        PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
-        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        validate_workspace_folder_input_with_dirs, window_close_state_from_response,
+        workspace_drop_layout_path, workspace_folder_path_from_input,
+        workspace_notification_message, Direction, EditableCaptureContext, NeighborScore,
+        PaneBounds, PaneCreateDirection, PaneCreateTargetError, PortalColorSchemePreference,
+        SessionSaveAccess, SessionSaveRequest, WindowCloseAction, WindowCloseState,
+        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WINDOW_CLOSE_BUTTON_CANCEL,
+        WINDOW_CLOSE_BUTTON_CONFIRM, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
@@ -6837,5 +6918,23 @@ mod tests {
             .unwrap_err();
 
         assert!(error.ends_with(" is not a folder"));
+    }
+
+    #[test]
+    fn window_close_state_confirms_once_and_defaults_to_cancel() {
+        let mut close = WindowCloseState::default();
+
+        assert_eq!(close.request(), WindowCloseAction::Confirm);
+        assert_eq!(close.request(), WindowCloseAction::Ignore);
+        assert!(!close.resolve(WINDOW_CLOSE_BUTTON_CANCEL));
+        assert_eq!(close, WindowCloseState::default());
+
+        assert_eq!(close.request(), WindowCloseAction::Confirm);
+        assert!(close.resolve(WINDOW_CLOSE_BUTTON_CONFIRM));
+        assert_eq!(
+            close,
+            window_close_state_from_response(WINDOW_CLOSE_BUTTON_CONFIRM)
+        );
+        assert_eq!(close.request(), WindowCloseAction::Proceed);
     }
 }
