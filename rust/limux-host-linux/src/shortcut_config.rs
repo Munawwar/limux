@@ -26,8 +26,10 @@ pub enum ShortcutId {
     CycleTabPrev,
     CycleTabNext,
     SplitDown,
+    SplitPanelDown,
     NewTerminalInFocusedPane,
     SplitRight,
+    SplitPanelRight,
     CloseFocusedPane,
     ToggleFocusedPaneZoom,
     NewTerminal,
@@ -78,8 +80,10 @@ pub enum ShortcutCommand {
     CycleTabPrev,
     CycleTabNext,
     SplitDown,
+    SplitPanelDown,
     NewTerminal,
     SplitRight,
+    SplitPanelRight,
     CloseFocusedPane,
     ToggleFocusedPaneZoom,
     FocusLeft,
@@ -311,7 +315,7 @@ struct ShortcutConfigFile {
     shortcuts: HashMap<String, serde_json::Value>,
 }
 
-const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 48] = [
+const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 50] = [
     ShortcutDefinition {
         id: ShortcutId::NewWorkspace,
         config_key: "new_workspace",
@@ -445,6 +449,17 @@ const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 48] = [
         editable_capture_policy: EditableCapturePolicy::BypassInEditable,
     },
     ShortcutDefinition {
+        id: ShortcutId::SplitPanelDown,
+        config_key: "split_panel_down",
+        action_name: "win.split-panel-down",
+        default_accel: "",
+        label: "Split Panel Down",
+        registers_gtk_accel: false,
+        command: ShortcutCommand::SplitPanelDown,
+        scope: ShortcutScope::Window,
+        editable_capture_policy: EditableCapturePolicy::BypassInEditable,
+    },
+    ShortcutDefinition {
         id: ShortcutId::NewTerminalInFocusedPane,
         config_key: "new_terminal_in_focused_pane",
         action_name: "win.new-terminal-in-focused-pane",
@@ -463,6 +478,17 @@ const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 48] = [
         label: "Split Right",
         registers_gtk_accel: false,
         command: ShortcutCommand::SplitRight,
+        scope: ShortcutScope::Window,
+        editable_capture_policy: EditableCapturePolicy::BypassInEditable,
+    },
+    ShortcutDefinition {
+        id: ShortcutId::SplitPanelRight,
+        config_key: "split_panel_right",
+        action_name: "win.split-panel-right",
+        default_accel: "",
+        label: "Split Panel Right",
+        registers_gtk_accel: false,
+        command: ShortcutCommand::SplitPanelRight,
         scope: ShortcutScope::Window,
         editable_capture_policy: EditableCapturePolicy::BypassInEditable,
     },
@@ -1054,7 +1080,7 @@ impl ResolvedShortcut {
             .map(NormalizedShortcut::to_display_label)
     }
 
-    pub fn default_display_label(&self) -> String {
+    pub fn default_display_label(&self) -> Option<String> {
         self.definition.default_display_label()
     }
 }
@@ -1088,7 +1114,7 @@ impl ResolvedShortcutConfig {
 
     pub fn default_display_label_for_id(&self, id: ShortcutId) -> Option<String> {
         self.find_by_id(id)
-            .map(ResolvedShortcut::default_display_label)
+            .and_then(ResolvedShortcut::default_display_label)
     }
 
     pub fn tooltip_text(&self, id: ShortcutId, base: &str) -> String {
@@ -1114,13 +1140,14 @@ impl ResolvedShortcutConfig {
             .iter()
             .filter_map(|shortcut| {
                 let default_binding = shortcut.definition.default_binding();
-                match &shortcut.binding {
-                    Some(binding) if binding == &default_binding => None,
-                    Some(binding) => Some((
+                match (&shortcut.binding, default_binding.as_ref()) {
+                    (Some(binding), Some(default_binding)) if binding == default_binding => None,
+                    (None, None) => None,
+                    (Some(binding), _) => Some((
                         shortcut.definition.config_key.to_string(),
                         Value::String(binding.to_config_accel()),
                     )),
-                    None => Some((shortcut.definition.config_key.to_string(), Value::Null)),
+                    (None, _) => Some((shortcut.definition.config_key.to_string(), Value::Null)),
                 }
             })
             .collect()
@@ -1153,12 +1180,15 @@ impl ShortcutDefinition {
         !matches!(self.id, ShortcutId::ToggleFullscreen)
     }
 
-    pub fn default_binding(&self) -> NormalizedShortcut {
-        NormalizedShortcut::parse(self.default_accel).expect("default shortcuts should be valid")
+    pub fn default_binding(&self) -> Option<NormalizedShortcut> {
+        let accel = self.default_accel.trim();
+        (!accel.is_empty())
+            .then(|| NormalizedShortcut::parse(accel).expect("default shortcuts should be valid"))
     }
 
-    pub fn default_display_label(&self) -> String {
-        self.default_binding().to_display_label()
+    pub fn default_display_label(&self) -> Option<String> {
+        self.default_binding()
+            .map(|binding| binding.to_display_label())
     }
 
     pub fn action_basename(&self) -> &'static str {
@@ -1198,7 +1228,7 @@ pub fn default_shortcuts() -> ResolvedShortcutConfig {
             .iter()
             .map(|definition| ResolvedShortcut {
                 definition,
-                binding: Some(definition.default_binding()),
+                binding: definition.default_binding(),
             })
             .collect(),
         warnings: Vec::new(),
@@ -1702,7 +1732,7 @@ mod tests {
 
     #[test]
     fn definitions_cover_current_host_shortcuts() {
-        assert_eq!(definitions().len(), 48);
+        assert_eq!(definitions().len(), 50);
     }
 
     #[test]
@@ -2196,6 +2226,8 @@ mod tests {
             resolved.command_for_runtime_combo("ctrl+shift+t"),
             Some(ShortcutCommand::NewTerminal)
         );
+        assert_eq!(resolved.command_for_runtime_combo("ctrl+alt+d"), None);
+        assert_eq!(resolved.command_for_runtime_combo("ctrl+alt+shift+d"), None);
         assert_eq!(
             resolved.command_for_runtime_combo("ctrl+9"),
             Some(ShortcutCommand::ActivateLastWorkspace)
@@ -2215,9 +2247,15 @@ mod tests {
         assert_eq!(
             resolved
                 .find_by_id(ShortcutId::SplitRight)
-                .map(ResolvedShortcut::default_display_label)
+                .and_then(ResolvedShortcut::default_display_label)
                 .as_deref(),
             Some("Ctrl+D")
+        );
+        assert_eq!(
+            resolved
+                .default_display_label_for_id(ShortcutId::SplitPanelRight)
+                .as_deref(),
+            None
         );
         assert_eq!(
             resolved

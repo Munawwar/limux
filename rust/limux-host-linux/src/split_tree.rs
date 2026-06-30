@@ -9,7 +9,7 @@ use crate::layout_state::{self, LayoutNodeState, PaneState, SplitOrientation, Sp
 use crate::pane;
 use crate::window::{
     apply_split_ratio_after_layout, attach_split_position_persistence, update_split_ratio_state,
-    State,
+    State, SPLIT_PANE_CSS_CLASS,
 };
 
 // ---------------------------------------------------------------------------
@@ -453,6 +453,7 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
                 .hexpand(true)
                 .vexpand(true)
                 .build();
+            paned.add_css_class(SPLIT_PANE_CSS_CLASS);
             paned.set_shrink_start_child(false);
             paned.set_shrink_end_child(false);
             paned.set_resize_start_child(true);
@@ -460,14 +461,11 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
 
             let ratio_val = *ratio.borrow();
             update_split_ratio_state(&paned, ratio_val);
-            attach_split_position_persistence(state, &paned);
+            let applying = Rc::new(Cell::new(true));
+            attach_split_position_persistence(state, &paned, applying.clone());
 
-            // Flag to suppress position_notify during programmatic set_position calls
-            // (initial layout and workspace re-map). Without this, set_position triggers
-            // position_notify which recalculates the ratio from the not-yet-stable pixel
-            // position, corrupting the stored ratio.
-            let applying = Rc::new(Cell::new(false));
-
+            // Ignore early position-notify churn until the first restored ratio
+            // has actually been applied with a real allocation.
             // Wire resize drags back to the shared ratio cell in the data model.
             let shared_ratio = ratio.clone();
             let applying_for_notify = applying.clone();

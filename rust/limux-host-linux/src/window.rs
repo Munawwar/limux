@@ -63,6 +63,47 @@ struct Workspace {
     path_label: gtk::Label,
 }
 
+const WINDOW_CLOSE_BUTTON_CANCEL: i32 = 0;
+const WINDOW_CLOSE_BUTTON_CONFIRM: i32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowCloseAction {
+    Proceed,
+    Confirm,
+    Ignore,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WindowCloseState {
+    confirmed: bool,
+    dialog_open: bool,
+}
+
+impl WindowCloseState {
+    fn request(&mut self) -> WindowCloseAction {
+        if self.confirmed {
+            WindowCloseAction::Proceed
+        } else if self.dialog_open {
+            WindowCloseAction::Ignore
+        } else {
+            self.dialog_open = true;
+            WindowCloseAction::Confirm
+        }
+    }
+
+    fn resolve(&mut self, response: i32) -> bool {
+        *self = window_close_state_from_response(response);
+        self.confirmed
+    }
+}
+
+fn window_close_state_from_response(response: i32) -> WindowCloseState {
+    WindowCloseState {
+        confirmed: response == WINDOW_CLOSE_BUTTON_CONFIRM,
+        dialog_open: false,
+    }
+}
+
 pub(crate) struct AppState {
     app: adw::Application,
     window: adw::ApplicationWindow,
@@ -85,6 +126,7 @@ pub(crate) struct AppState {
     save_queued: bool,
     workspace_dragging: Option<String>,
     desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
+    window_close: WindowCloseState,
     _theme_portal_signal: Option<gio::SignalSubscription>,
     _theme_gnome_settings: Option<gio::Settings>,
     _theme_gnome_signal: Option<glib::SignalHandlerId>,
@@ -428,7 +470,12 @@ fn resolve_pane_create_source_id(
         let requested = normalize_surface_handle(surface_id);
         return surface_to_pane
             .iter()
-            .find(|(known_surface_id, _)| *known_surface_id == requested)
+            .find(|(known_surface_id, _)| {
+                *known_surface_id == requested
+                    || known_surface_id
+                        .strip_prefix(requested)
+                        .is_some_and(|suffix| suffix.starts_with(':'))
+            })
             .map(|(_, pane_id)| *pane_id)
             .ok_or_else(|| PaneCreateTargetError::InvalidSurfaceId(surface_id.to_string()));
     }
@@ -703,7 +750,15 @@ fn surface_health_payload(
     let requested = surface_hint.map(normalize_surface_handle);
     let surfaces = pane::surface_summaries_for_root(&workspace.root)
         .into_iter()
-        .filter(|surface| requested.is_none_or(|requested| surface.surface_id == requested))
+        .filter(|surface| {
+            requested.is_none_or(|requested| {
+                surface.surface_id == requested
+                    || surface
+                        .surface_id
+                        .strip_prefix(requested)
+                        .is_some_and(|suffix| suffix.starts_with(':'))
+            })
+        })
         .enumerate()
         .map(|(index, surface)| surface_health_row(state, workspace, index, surface))
         .collect::<Vec<_>>();
@@ -1032,6 +1087,8 @@ fn split_ratio_state(paned: &gtk::Paned) -> Option<Rc<RefCell<f64>>> {
     }
 }
 
+type SplitRatioRestoreScheduler = dyn Fn(&gtk::Paned, &Rc<RefCell<f64>>, &Rc<Cell<bool>>) + 'static;
+
 pub(crate) fn update_split_ratio_state(paned: &gtk::Paned, ratio: f64) {
     let ratio = layout_state::clamp_split_ratio(ratio);
     if let Some(stored_ratio) = split_ratio_state(paned) {
@@ -1062,12 +1119,7 @@ fn build_workspace_root(
     (root, container)
 }
 
-fn apply_ratio_value(
-    paned: &gtk::Paned,
-    orientation: gtk::Orientation,
-    ratio: f64,
-    applying: &Rc<Cell<bool>>,
-) -> bool {
+fn apply_ratio_value(paned: &gtk::Paned, orientation: gtk::Orientation, ratio: f64) -> bool {
     let ratio = layout_state::clamp_split_ratio(ratio);
     let allocation = paned.allocation();
     let size = if orientation == gtk::Orientation::Horizontal {
@@ -1078,10 +1130,8 @@ fn apply_ratio_value(
     if size <= 0 {
         return false;
     }
-    applying.set(true);
     paned.set_position(layout_state::split_position_from_ratio(ratio, size));
     update_split_ratio_state(paned, ratio);
-    applying.set(false);
     true
 }
 
@@ -1091,34 +1141,93 @@ pub(crate) fn apply_split_ratio_after_layout(
     ratio_cell: Rc<RefCell<f64>>,
     applying: Rc<Cell<bool>>,
 ) {
-    // Capture the ratio by value for the initial idle callback so that early
-    // position_notify events (which may corrupt the cell) don't affect it.
-    let initial_ratio = *ratio_cell.borrow();
+    let restore_epoch = Rc::new(Cell::new(0u64));
+    let schedule_restore: Rc<SplitRatioRestoreScheduler> =
+        Rc::new(move |paned, ratio_cell, applying| {
+            let epoch = restore_epoch.get().wrapping_add(1);
+            restore_epoch.set(epoch);
+            applying.set(true);
 
-    let paned_for_idle = paned.clone();
-    let applying_for_idle = applying.clone();
-    glib::idle_add_local_once(move || {
-        apply_ratio_value(
-            &paned_for_idle,
-            orientation,
-            initial_ratio,
-            &applying_for_idle,
-        );
-    });
+            let attempts = Rc::new(Cell::new(0usize));
+            let last_size = Rc::new(Cell::new(-1));
+            let settled_frames = Rc::new(Cell::new(0usize));
+            let paned = paned.clone();
+            let ratio_cell = ratio_cell.clone();
+            let applying = applying.clone();
+            let restore_epoch = restore_epoch.clone();
+            let attempts_for_tick = attempts.clone();
+            let last_size_for_tick = last_size.clone();
+            let settled_frames_for_tick = settled_frames.clone();
+
+            paned.add_tick_callback(move |paned, _| {
+                if restore_epoch.get() != epoch {
+                    return glib::ControlFlow::Break;
+                }
+
+                attempts_for_tick.set(attempts_for_tick.get() + 1);
+                let ratio = layout_state::clamp_split_ratio(*ratio_cell.borrow());
+                let allocation = paned.allocation();
+                let size = if orientation == gtk::Orientation::Horizontal {
+                    allocation.width()
+                } else {
+                    allocation.height()
+                };
+                if size <= 0 {
+                    last_size_for_tick.set(-1);
+                    settled_frames_for_tick.set(0);
+                } else {
+                    let target = layout_state::split_position_from_ratio(ratio, size);
+                    if paned.position() != target {
+                        apply_ratio_value(paned, orientation, ratio);
+                        settled_frames_for_tick.set(0);
+                    } else {
+                        update_split_ratio_state(paned, ratio);
+                        settled_frames_for_tick.set(if last_size_for_tick.get() == size {
+                            settled_frames_for_tick.get() + 1
+                        } else {
+                            1
+                        });
+                    }
+                    last_size_for_tick.set(size);
+                    if settled_frames_for_tick.get() >= 2 {
+                        applying.set(false);
+                        return glib::ControlFlow::Break;
+                    }
+                }
+
+                if attempts_for_tick.get() >= 120 {
+                    applying.set(false);
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+        });
+
+    schedule_restore(paned, &ratio_cell, &applying);
 
     let paned_for_map = paned.clone();
+    let ratio_cell_for_map = ratio_cell.clone();
+    let applying_for_map = applying.clone();
+    let schedule_restore_for_map = schedule_restore.clone();
     // Re-apply the current data model ratio on every map event (workspace switches).
     // Reads from the cell so drag-adjusted ratios are restored correctly.
     paned.connect_map(move |_| {
-        let ratio = *ratio_cell.borrow();
-        apply_ratio_value(&paned_for_map, orientation, ratio, &applying);
+        schedule_restore_for_map(&paned_for_map, &ratio_cell_for_map, &applying_for_map);
     });
 }
 
-pub(crate) fn attach_split_position_persistence(state: &State, paned: &gtk::Paned) {
+pub(crate) fn attach_split_position_persistence(
+    state: &State,
+    paned: &gtk::Paned,
+    applying: Rc<Cell<bool>>,
+) {
     update_split_ratio_state(paned, layout_state::DEFAULT_SPLIT_RATIO);
     let state = state.clone();
     paned.connect_position_notify(move |paned| {
+        if applying.get() {
+            return;
+        }
         let allocation = paned.allocation();
         let size = if paned.orientation() == gtk::Orientation::Horizontal {
             allocation.width()
@@ -1143,6 +1252,7 @@ const HOST_ENTRY_CSS_CLASS: &str = "limux-host-entry";
 const WORKSPACE_RENAME_ENTRY_CSS_CLASS: &str = "limux-ws-rename-entry";
 const WORKSPACE_RENAME_ENTRY_CSS_CLASSES: [&str; 2] =
     [HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS];
+pub(crate) const SPLIT_PANE_CSS_CLASS: &str = "limux-split-pane";
 const SIDEBAR_HANDLE_CSS_CLASS: &str = "limux-sidebar-handle";
 const SIDEBAR_HANDLE_CURSOR_NAME: &str = "col-resize";
 const SIDEBAR_RESIZE_HANDLE_WIDTH_PX: i32 = 3;
@@ -1316,6 +1426,17 @@ row:selected .limux-ws-path {
 }
 .limux-content {
     background-color: @window_bg_color;
+}
+.limux-terminal-split-dim {
+    background-color: alpha(@window_bg_color, 0.30);
+}
+.limux-split-pane > separator {
+    background-color: alpha(@window_fg_color, 0.16);
+    min-width: 2px;
+    min-height: 2px;
+}
+.limux-split-pane > separator:hover {
+    background-color: alpha(@window_fg_color, 0.24);
 }
 .limux-sidebar-handle {
     min-width: 3px;
@@ -1549,6 +1670,7 @@ pub fn build_window(app: &adw::Application) {
         save_queued: false,
         workspace_dragging: None,
         desktop_notification_routes: HashMap::new(),
+        window_close: WindowCloseState::default(),
         _theme_portal_signal: None,
         _theme_gnome_settings: None,
         _theme_gnome_signal: None,
@@ -1688,11 +1810,21 @@ pub fn build_window(app: &adw::Application) {
     {
         let state = state.clone();
         window.connect_close_request(move |_| {
-            save_session_now(&state);
-            CONTROL_STATE.with(|slot| {
-                slot.borrow_mut().take();
-            });
-            glib::Propagation::Proceed
+            let action = { state.borrow_mut().window_close.request() };
+            match action {
+                WindowCloseAction::Proceed => {
+                    save_session_now(&state);
+                    CONTROL_STATE.with(|slot| {
+                        slot.borrow_mut().take();
+                    });
+                    glib::Propagation::Proceed
+                }
+                WindowCloseAction::Confirm => {
+                    request_window_close_confirmation(&state);
+                    glib::Propagation::Stop
+                }
+                WindowCloseAction::Ignore => glib::Propagation::Stop,
+            }
         });
     }
 
@@ -2066,7 +2198,8 @@ fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
             true
         }
         ShortcutCommand::QuitApp => {
-            quit_app(state);
+            let window = state.borrow().window.clone();
+            window.close();
             true
         }
         ShortcutCommand::NewInstance => spawn_new_instance(state),
@@ -2099,7 +2232,7 @@ fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
             true
         }
         ShortcutCommand::SplitDown => {
-            split_focused_pane(state, gtk::Orientation::Vertical);
+            split_focused_terminal(state, gtk::Orientation::Vertical);
             true
         }
         ShortcutCommand::NewTerminal => {
@@ -2107,7 +2240,15 @@ fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
             true
         }
         ShortcutCommand::SplitRight => {
-            split_focused_pane(state, gtk::Orientation::Horizontal);
+            split_focused_terminal(state, gtk::Orientation::Horizontal);
+            true
+        }
+        ShortcutCommand::SplitPanelDown => {
+            split_focused_panel(state, gtk::Orientation::Vertical);
+            true
+        }
+        ShortcutCommand::SplitPanelRight => {
+            split_focused_panel(state, gtk::Orientation::Horizontal);
             true
         }
         ShortcutCommand::CloseFocusedPane => {
@@ -5219,9 +5360,34 @@ fn show_runtime_error(state: &State, title: &str, detail: &str) {
     dialog.show(Some(&window));
 }
 
-fn quit_app(state: &State) {
-    save_session_now(state);
-    state.borrow().app.quit();
+fn request_window_close_confirmation(state: &State) {
+    let window = {
+        let s = state.borrow();
+        if s.window_close.confirmed || !s.window_close.dialog_open {
+            return;
+        }
+        s.window.clone()
+    };
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message("Close Limux?")
+        .detail("Your current session will be saved before the window closes.")
+        .build();
+    dialog.set_buttons(&["Don't Close", "Close"]);
+    dialog.set_default_button(WINDOW_CLOSE_BUTTON_CANCEL);
+    dialog.set_cancel_button(WINDOW_CLOSE_BUTTON_CANCEL);
+
+    let state = state.clone();
+    dialog.choose(Some(&window), None::<&gio::Cancellable>, move |response| {
+        let should_close = response.ok().is_some_and(|button| {
+            let mut s = state.borrow_mut();
+            s.window_close.resolve(button)
+        });
+        if should_close {
+            let window = state.borrow().window.clone();
+            window.close();
+        }
+    });
 }
 
 fn spawn_new_instance(state: &State) -> bool {
@@ -5362,7 +5528,27 @@ fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {
     }
 }
 
-fn split_focused_pane(state: &State, orientation: gtk::Orientation) {
+fn split_focused_terminal(state: &State, orientation: gtk::Orientation) {
+    if let Some((ws_id, pane_widget)) = find_focused_pane(state) {
+        if pane::split_active_terminal_tab_in_pane(&pane_widget, orientation) {
+            return;
+        }
+        let _ = split_pane(
+            state,
+            &ws_id,
+            &pane_widget,
+            orientation,
+            SplitPaneOptions {
+                initial_state: None,
+                skip_default_tab: false,
+                new_pane_first: false,
+                persist: true,
+            },
+        );
+    }
+}
+
+fn split_focused_panel(state: &State, orientation: gtk::Orientation) {
     if let Some((ws_id, pane_widget)) = find_focused_pane(state) {
         let _ = split_pane(
             state,
@@ -5883,11 +6069,13 @@ mod tests {
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation,
         should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
-        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
-        workspace_folder_path_from_input, workspace_notification_message, Direction,
-        EditableCaptureContext, NeighborScore, PaneBounds, PaneCreateDirection,
-        PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
-        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        validate_workspace_folder_input_with_dirs, window_close_state_from_response,
+        workspace_drop_layout_path, workspace_folder_path_from_input,
+        workspace_notification_message, Direction, EditableCaptureContext, NeighborScore,
+        PaneBounds, PaneCreateDirection, PaneCreateTargetError, PortalColorSchemePreference,
+        SessionSaveAccess, SessionSaveRequest, WindowCloseAction, WindowCloseState,
+        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WINDOW_CLOSE_BUTTON_CANCEL,
+        WINDOW_CLOSE_BUTTON_CONFIRM, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
@@ -6131,6 +6319,8 @@ mod tests {
         assert!(BASE_CSS.contains(".limux-host-entry"));
         assert!(BASE_CSS.contains(".limux-host-entry text"));
         assert!(BASE_CSS.contains(".limux-host-entry text placeholder"));
+        assert!(BASE_CSS.contains(".limux-terminal-split-dim"));
+        assert!(BASE_CSS.contains(".limux-split-pane > separator"));
         assert!(BASE_CSS.contains("caret-color: currentColor;"));
     }
 
@@ -6397,6 +6587,40 @@ mod tests {
         assert_eq!(
             shortcut_command_from_key_event(&shortcuts, gdk::Key::F11, gdk::ModifierType::empty()),
             Some(ShortcutCommand::ToggleFullscreen)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::D,
+                gdk::ModifierType::CONTROL_MASK
+            ),
+            Some(ShortcutCommand::SplitRight)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::D,
+                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK
+            ),
+            None
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::D,
+                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK
+            ),
+            Some(ShortcutCommand::SplitDown)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::D,
+                gdk::ModifierType::CONTROL_MASK
+                    | gdk::ModifierType::ALT_MASK
+                    | gdk::ModifierType::SHIFT_MASK
+            ),
+            None
         );
         assert_eq!(
             shortcut_command_from_key_event(
@@ -6694,5 +6918,23 @@ mod tests {
             .unwrap_err();
 
         assert!(error.ends_with(" is not a folder"));
+    }
+
+    #[test]
+    fn window_close_state_confirms_once_and_defaults_to_cancel() {
+        let mut close = WindowCloseState::default();
+
+        assert_eq!(close.request(), WindowCloseAction::Confirm);
+        assert_eq!(close.request(), WindowCloseAction::Ignore);
+        assert!(!close.resolve(WINDOW_CLOSE_BUTTON_CANCEL));
+        assert_eq!(close, WindowCloseState::default());
+
+        assert_eq!(close.request(), WindowCloseAction::Confirm);
+        assert!(close.resolve(WINDOW_CLOSE_BUTTON_CONFIRM));
+        assert_eq!(
+            close,
+            window_close_state_from_response(WINDOW_CLOSE_BUTTON_CONFIRM)
+        );
+        assert_eq!(close.request(), WindowCloseAction::Proceed);
     }
 }

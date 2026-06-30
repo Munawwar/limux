@@ -52,6 +52,19 @@ pub struct TerminalIdentity {
     pub surface_id: String,
 }
 
+pub(crate) struct HoverFocusGuard;
+
+impl Drop for HoverFocusGuard {
+    fn drop(&mut self) {
+        HOVER_FOCUS_SUPPRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+pub(crate) fn suspend_hover_focus() -> HoverFocusGuard {
+    HOVER_FOCUS_SUPPRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    HoverFocusGuard
+}
+
 /// Per-surface state, stored in a global registry keyed by surface pointer.
 struct SurfaceEntry {
     gl_area: gtk::GLArea,
@@ -160,6 +173,7 @@ impl TerminalImeState {
 }
 
 thread_local! {
+    static HOVER_FOCUS_SUPPRESS_DEPTH: Cell<usize> = const { Cell::new(0) };
     static SURFACE_MAP: RefCell<HashMap<usize, SurfaceEntry>> = RefCell::new(HashMap::new());
 }
 
@@ -167,6 +181,7 @@ thread_local! {
 pub struct TerminalHandle {
     surface_cell: Rc<RefCell<Option<ghostty_surface_t>>>,
     gl_area: gtk::GLArea,
+    split_dim_overlay: gtk::Widget,
     search_bar: gtk::SearchBar,
     search_entry: gtk::SearchEntry,
     callbacks: Rc<RefCell<TerminalCallbacks>>,
@@ -200,6 +215,10 @@ impl TerminalHandle {
         };
 
         refresh_realized_surface_display(surface, &self.gl_area);
+    }
+
+    pub fn set_split_dimmed(&self, dimmed: bool) {
+        self.split_dim_overlay.set_visible(dimmed);
     }
 
     pub fn perform_binding_action(&self, action: &str) -> bool {
@@ -1077,11 +1096,14 @@ pub struct TerminalCallbacks {
     pub on_pwd_changed: Box<PwdChangedCallback>,
     pub on_desktop_notification: Box<DesktopNotificationCallback>,
     pub on_bell: Box<BellCallback>,
+    pub on_focus: Box<VoidCallback>,
     pub on_close: Box<VoidCallback>,
     pub on_open_url: Box<OpenUrlCallback>,
     pub on_open_browser_here: Box<VoidCallback>,
     pub on_split_right: Box<VoidCallback>,
     pub on_split_down: Box<VoidCallback>,
+    pub on_split_panel_right: Box<VoidCallback>,
+    pub on_split_panel_down: Box<VoidCallback>,
     pub on_open_keybinds: Box<WidgetCallback>,
     pub identity: Box<IdentityCallback>,
 }
@@ -1152,6 +1174,16 @@ pub fn create_terminal(
     overlay.set_child(Some(&gl_area));
     overlay.set_hexpand(true);
     overlay.set_vexpand(true);
+    let split_dim_overlay = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    split_dim_overlay.add_css_class("limux-terminal-split-dim");
+    split_dim_overlay.set_hexpand(true);
+    split_dim_overlay.set_vexpand(true);
+    split_dim_overlay.set_halign(gtk::Align::Fill);
+    split_dim_overlay.set_valign(gtk::Align::Fill);
+    split_dim_overlay.set_can_target(false);
+    split_dim_overlay.set_focusable(false);
+    split_dim_overlay.set_visible(false);
+    overlay.add_overlay(&split_dim_overlay);
 
     let scrollbar_adjustment = gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 0.0, 0.0);
     let scrollbar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&scrollbar_adjustment));
@@ -1187,6 +1219,7 @@ pub fn create_terminal(
     let handle = TerminalHandle {
         surface_cell: surface_cell.clone(),
         gl_area: gl_area.clone(),
+        split_dim_overlay: split_dim_overlay.upcast(),
         search_bar: search_bar.clone(),
         search_entry: search_entry.clone(),
         callbacks: callbacks.clone(),
@@ -1684,7 +1717,7 @@ pub fn create_terminal(
         let had_focus = had_focus.clone();
         let motion = gtk::EventControllerMotion::new();
         motion.connect_enter(move |ctrl, x, y| {
-            if (hover_focus)() {
+            if HOVER_FOCUS_SUPPRESS_DEPTH.with(|depth| depth.get() == 0) && (hover_focus)() {
                 // Match common Hyprland/Omarchy-style focus-follows-mouse behavior:
                 // as soon as the pointer enters a terminal, focus it so typing works
                 // immediately without an extra click.
@@ -1730,6 +1763,7 @@ pub fn create_terminal(
         let had_focus_leave = had_focus.clone();
         let im_context_enter = im_context.clone();
         let im_context_leave = im_context.clone();
+        let callbacks_for_focus = callbacks.clone();
         let focus_ctrl = gtk::EventControllerFocus::new();
         let sc = surface_cell.clone();
         focus_ctrl.connect_enter(move |_| {
@@ -1738,6 +1772,7 @@ pub fn create_terminal(
             if let Some(surface) = *sc.borrow() {
                 unsafe { ghostty_surface_set_focus(surface, true) };
             }
+            (callbacks_for_focus.borrow().on_focus)();
         });
         focus_ctrl.connect_leave(move |_| {
             had_focus_leave.set(false);
@@ -1886,6 +1921,8 @@ fn show_terminal_context_menu(
         ("Browser", true),
         ("Split Right", true),
         ("Split Down", true),
+        ("Split Panel Right", true),
+        ("Split Panel Down", true),
         ("Keybinds", true),
         ("---", false),
         ("Clear", true),
@@ -1980,6 +2017,14 @@ fn show_terminal_context_menu(
                     "Split Down" => {
                         let callbacks = cb.borrow();
                         (callbacks.on_split_down)();
+                    }
+                    "Split Panel Right" => {
+                        let callbacks = cb.borrow();
+                        (callbacks.on_split_panel_right)();
+                    }
+                    "Split Panel Down" => {
+                        let callbacks = cb.borrow();
+                        (callbacks.on_split_panel_down)();
                     }
                     "Keybinds" => {
                         let anchor: gtk::Widget = gl_area.clone().upcast();

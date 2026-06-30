@@ -142,7 +142,8 @@ pub fn build_keybind_editor(
                 "Default: {}",
                 shortcuts
                     .default_display_label_for_id(definition.id)
-                    .unwrap_or_else(|| definition.default_display_label())
+                    .or_else(|| definition.default_display_label())
+                    .unwrap_or_else(|| "None".to_string())
             ))
             .xalign(0.0)
             .wrap(true)
