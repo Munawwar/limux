@@ -1102,8 +1102,8 @@ pub struct TerminalCallbacks {
     pub on_open_browser_here: Box<VoidCallback>,
     pub on_split_right: Box<VoidCallback>,
     pub on_split_down: Box<VoidCallback>,
-    pub on_split_within_right: Box<VoidCallback>,
-    pub on_split_within_down: Box<VoidCallback>,
+    pub on_split_panel_right: Box<VoidCallback>,
+    pub on_split_panel_down: Box<VoidCallback>,
     pub on_open_keybinds: Box<WidgetCallback>,
     pub identity: Box<IdentityCallback>,
 }
@@ -1921,8 +1921,8 @@ fn show_terminal_context_menu(
         ("Browser", true),
         ("Split Right", true),
         ("Split Down", true),
-        ("Split Within Right", true),
-        ("Split Within Down", true),
+        ("Split Panel Right", true),
+        ("Split Panel Down", true),
         ("Keybinds", true),
         ("---", false),
         ("Clear", true),
@@ -2018,13 +2018,13 @@ fn show_terminal_context_menu(
                         let callbacks = cb.borrow();
                         (callbacks.on_split_down)();
                     }
-                    "Split Within Right" => {
+                    "Split Panel Right" => {
                         let callbacks = cb.borrow();
-                        (callbacks.on_split_within_right)();
+                        (callbacks.on_split_panel_right)();
                     }
-                    "Split Within Down" => {
+                    "Split Panel Down" => {
                         let callbacks = cb.borrow();
-                        (callbacks.on_split_within_down)();
+                        (callbacks.on_split_panel_down)();
                     }
                     "Keybinds" => {
                         let anchor: gtk::Widget = gl_area.clone().upcast();

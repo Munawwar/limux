@@ -2178,7 +2178,7 @@ fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
             true
         }
         ShortcutCommand::SplitDown => {
-            split_focused_pane(state, gtk::Orientation::Vertical);
+            split_focused_terminal(state, gtk::Orientation::Vertical);
             true
         }
         ShortcutCommand::NewTerminal => {
@@ -2186,7 +2186,15 @@ fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
             true
         }
         ShortcutCommand::SplitRight => {
-            split_focused_pane(state, gtk::Orientation::Horizontal);
+            split_focused_terminal(state, gtk::Orientation::Horizontal);
+            true
+        }
+        ShortcutCommand::SplitPanelDown => {
+            split_focused_panel(state, gtk::Orientation::Vertical);
+            true
+        }
+        ShortcutCommand::SplitPanelRight => {
+            split_focused_panel(state, gtk::Orientation::Horizontal);
             true
         }
         ShortcutCommand::CloseFocusedPane => {
@@ -5441,7 +5449,27 @@ fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {
     }
 }
 
-fn split_focused_pane(state: &State, orientation: gtk::Orientation) {
+fn split_focused_terminal(state: &State, orientation: gtk::Orientation) {
+    if let Some((ws_id, pane_widget)) = find_focused_pane(state) {
+        if pane::split_active_terminal_tab_in_pane(&pane_widget, orientation) {
+            return;
+        }
+        let _ = split_pane(
+            state,
+            &ws_id,
+            &pane_widget,
+            orientation,
+            SplitPaneOptions {
+                initial_state: None,
+                skip_default_tab: false,
+                new_pane_first: false,
+                persist: true,
+            },
+        );
+    }
+}
+
+fn split_focused_panel(state: &State, orientation: gtk::Orientation) {
     if let Some((ws_id, pane_widget)) = find_focused_pane(state) {
         let _ = split_pane(
             state,
@@ -6478,6 +6506,40 @@ mod tests {
         assert_eq!(
             shortcut_command_from_key_event(&shortcuts, gdk::Key::F11, gdk::ModifierType::empty()),
             Some(ShortcutCommand::ToggleFullscreen)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::D,
+                gdk::ModifierType::CONTROL_MASK
+            ),
+            Some(ShortcutCommand::SplitRight)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::D,
+                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK
+            ),
+            None
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::D,
+                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK
+            ),
+            Some(ShortcutCommand::SplitDown)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::D,
+                gdk::ModifierType::CONTROL_MASK
+                    | gdk::ModifierType::ALT_MASK
+                    | gdk::ModifierType::SHIFT_MASK
+            ),
+            None
         );
         assert_eq!(
             shortcut_command_from_key_event(

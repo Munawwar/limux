@@ -990,14 +990,20 @@ pub fn create_pane(
         let pw = outer.clone();
         let cb = callbacks.clone();
         split_h_btn.connect_clicked(move |_| {
-            (cb.on_split)(&pw.clone().upcast(), gtk::Orientation::Horizontal);
+            let pane_widget: gtk::Widget = pw.clone().upcast();
+            if !split_active_terminal_tab_in_pane(&pane_widget, gtk::Orientation::Horizontal) {
+                (cb.on_split)(&pane_widget, gtk::Orientation::Horizontal);
+            }
         });
     }
     {
         let pw = outer.clone();
         let cb = callbacks.clone();
         split_v_btn.connect_clicked(move |_| {
-            (cb.on_split)(&pw.clone().upcast(), gtk::Orientation::Vertical);
+            let pane_widget: gtk::Widget = pw.clone().upcast();
+            if !split_active_terminal_tab_in_pane(&pane_widget, gtk::Orientation::Vertical) {
+                (cb.on_split)(&pane_widget, gtk::Orientation::Vertical);
+            }
         });
     }
     {
@@ -1509,8 +1515,8 @@ fn placeholder_terminal_callbacks() -> TerminalCallbacks {
         on_open_browser_here: Box::new(|| {}),
         on_split_right: Box::new(|| {}),
         on_split_down: Box::new(|| {}),
-        on_split_within_right: Box::new(|| {}),
-        on_split_within_down: Box::new(|| {}),
+        on_split_panel_right: Box::new(|| {}),
+        on_split_panel_down: Box::new(|| {}),
         on_open_keybinds: Box::new(|_| {}),
         identity: Box::new(|| terminal::TerminalIdentity {
             workspace_id: None,
@@ -1642,7 +1648,7 @@ fn split_terminal_tab_leaf(
     title_label: &gtk::Label,
     source_leaf: &TerminalLeafState,
     orientation: gtk::Orientation,
-) {
+) -> bool {
     let new_leaf = create_terminal_leaf(
         internals,
         tab_id,
@@ -1657,7 +1663,44 @@ fn split_terminal_tab_leaf(
             make_terminal_callbacks(internals, &state, tab_id, title_label, leaf)
         });
         (internals.callbacks.on_state_changed)();
+        return true;
     }
+    false
+}
+
+pub fn split_active_terminal_tab_in_pane(
+    pane_widget: &gtk::Widget,
+    orientation: gtk::Orientation,
+) -> bool {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return false;
+    };
+    let (terminal_tab_state, tab_id, title_label) = {
+        let tab_state = internals.tab_state.borrow();
+        let active_id = tab_state
+            .active_tab
+            .clone()
+            .or_else(|| tab_state.tabs.first().map(|entry| entry.id.clone()));
+        let Some(active_id) = active_id else {
+            return false;
+        };
+        let Some(entry) = tab_state.tabs.iter().find(|entry| entry.id == active_id) else {
+            return false;
+        };
+        let TabKind::Terminal { state } = &entry.kind else {
+            return false;
+        };
+        (state.clone(), entry.id.clone(), entry.title_label.clone())
+    };
+    let source_leaf = terminal_tab_state.active_leaf();
+    split_terminal_tab_leaf(
+        &internals,
+        &terminal_tab_state,
+        &tab_id,
+        &title_label,
+        &source_leaf,
+        orientation,
+    )
 }
 
 fn make_terminal_callbacks(
@@ -1675,8 +1718,8 @@ fn make_terminal_callbacks(
     let callbacks_for_pwd = internals.callbacks.clone();
     let callbacks_for_close = internals.callbacks.clone();
     let callbacks_for_browser_here = internals.callbacks.clone();
-    let callbacks_for_split_right = internals.callbacks.clone();
-    let callbacks_for_split_down = internals.callbacks.clone();
+    let callbacks_for_split_panel_right = internals.callbacks.clone();
+    let callbacks_for_split_panel_down = internals.callbacks.clone();
     let callbacks_for_keybinds = internals.callbacks.clone();
     let callbacks_for_identity = internals.callbacks.clone();
     let tab_strip = internals.tab_strip.clone();
@@ -1785,20 +1828,6 @@ fn make_terminal_callbacks(
             }
         }),
         on_split_right: Box::new({
-            let pane_outer = internals.pane_outer.clone();
-            move || {
-                let pane_widget: gtk::Widget = pane_outer.clone().upcast();
-                (callbacks_for_split_right.on_split)(&pane_widget, gtk::Orientation::Horizontal);
-            }
-        }),
-        on_split_down: Box::new({
-            let pane_outer = internals.pane_outer.clone();
-            move || {
-                let pane_widget: gtk::Widget = pane_outer.clone().upcast();
-                (callbacks_for_split_down.on_split)(&pane_widget, gtk::Orientation::Vertical);
-            }
-        }),
-        on_split_within_right: Box::new({
             let internals = internals.clone();
             let title_label = title_label.clone();
             let tab_id = tab_id.to_string();
@@ -1810,7 +1839,7 @@ fn make_terminal_callbacks(
                 let title_label = title_label.clone();
                 let source_leaf = source_leaf.clone();
                 glib::idle_add_local_once(move || {
-                    split_terminal_tab_leaf(
+                    let _ = split_terminal_tab_leaf(
                         &internals,
                         &terminal_tab_state,
                         &tab_id,
@@ -1821,7 +1850,7 @@ fn make_terminal_callbacks(
                 });
             }
         }),
-        on_split_within_down: Box::new({
+        on_split_down: Box::new({
             let internals = internals.clone();
             let title_label = title_label.clone();
             let tab_id = tab_id.to_string();
@@ -1833,7 +1862,7 @@ fn make_terminal_callbacks(
                 let title_label = title_label.clone();
                 let source_leaf = source_leaf.clone();
                 glib::idle_add_local_once(move || {
-                    split_terminal_tab_leaf(
+                    let _ = split_terminal_tab_leaf(
                         &internals,
                         &terminal_tab_state,
                         &tab_id,
@@ -1842,6 +1871,23 @@ fn make_terminal_callbacks(
                         gtk::Orientation::Vertical,
                     );
                 });
+            }
+        }),
+        on_split_panel_right: Box::new({
+            let pane_outer = internals.pane_outer.clone();
+            move || {
+                let pane_widget: gtk::Widget = pane_outer.clone().upcast();
+                (callbacks_for_split_panel_right.on_split)(
+                    &pane_widget,
+                    gtk::Orientation::Horizontal,
+                );
+            }
+        }),
+        on_split_panel_down: Box::new({
+            let pane_outer = internals.pane_outer.clone();
+            move || {
+                let pane_widget: gtk::Widget = pane_outer.clone().upcast();
+                (callbacks_for_split_panel_down.on_split)(&pane_widget, gtk::Orientation::Vertical);
             }
         }),
         on_open_keybinds: Box::new({
@@ -4156,14 +4202,14 @@ mod tests {
         let remapped = resolve_shortcuts_from_str(
             r#"{
                 "shortcuts": {
-                    "split_right": "<Ctrl><Alt>d"
+                    "split_right": "<Ctrl><Alt>h"
                 }
             }"#,
         )
         .unwrap();
         assert_eq!(
             pane_action_tooltip(&remapped, "Split right", Some(ShortcutId::SplitRight)),
-            "Split right (Ctrl+Alt+D)"
+            "Split right (Ctrl+Alt+H)"
         );
 
         let unbound = resolve_shortcuts_from_str(
