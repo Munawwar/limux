@@ -2260,10 +2260,18 @@ fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
             true
         }
         ShortcutCommand::FocusLeft => {
-            focus_pane_in_direction(state, Direction::Left);
+            focus_inner_terminal_in_direction(state, pane::TerminalFocusDirection::Left);
             true
         }
         ShortcutCommand::FocusRight => {
+            focus_inner_terminal_in_direction(state, pane::TerminalFocusDirection::Right);
+            true
+        }
+        ShortcutCommand::FocusPanelLeft => {
+            focus_pane_in_direction(state, Direction::Left);
+            true
+        }
+        ShortcutCommand::FocusPanelRight => {
             focus_pane_in_direction(state, Direction::Right);
             true
         }
@@ -5610,6 +5618,13 @@ fn add_tab_to_focused_pane(_state: &State, _browser: bool) {
     }
 }
 
+fn focus_inner_terminal_in_direction(state: &State, direction: pane::TerminalFocusDirection) {
+    let Some((_ws_id, pane_widget)) = find_focused_pane(state) else {
+        return;
+    };
+    let _ = pane::focus_active_terminal_in_pane(&pane_widget, direction);
+}
+
 /// Direction for pane navigation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Direction {
@@ -6587,6 +6602,38 @@ mod tests {
         assert_eq!(
             shortcut_command_from_key_event(&shortcuts, gdk::Key::F11, gdk::ModifierType::empty()),
             Some(ShortcutCommand::ToggleFullscreen)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::comma,
+                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK
+            ),
+            Some(ShortcutCommand::FocusLeft)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::period,
+                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK
+            ),
+            Some(ShortcutCommand::FocusRight)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::Left,
+                gdk::ModifierType::CONTROL_MASK
+            ),
+            Some(ShortcutCommand::FocusPanelLeft)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::Right,
+                gdk::ModifierType::CONTROL_MASK
+            ),
+            Some(ShortcutCommand::FocusPanelRight)
         );
         assert_eq!(
             shortcut_command_from_key_event(

@@ -35,6 +35,8 @@ pub enum ShortcutId {
     NewTerminal,
     FocusLeft,
     FocusRight,
+    FocusPanelLeft,
+    FocusPanelRight,
     FocusUp,
     FocusDown,
     ActivateWorkspace1,
@@ -88,6 +90,8 @@ pub enum ShortcutCommand {
     ToggleFocusedPaneZoom,
     FocusLeft,
     FocusRight,
+    FocusPanelLeft,
+    FocusPanelRight,
     FocusUp,
     FocusDown,
     ActivateWorkspace1,
@@ -315,7 +319,7 @@ struct ShortcutConfigFile {
     shortcuts: HashMap<String, serde_json::Value>,
 }
 
-const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 50] = [
+const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 52] = [
     ShortcutDefinition {
         id: ShortcutId::NewWorkspace,
         config_key: "new_workspace",
@@ -529,7 +533,7 @@ const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 50] = [
         id: ShortcutId::FocusLeft,
         config_key: "focus_left",
         action_name: "win.focus-left",
-        default_accel: "<Ctrl>Left",
+        default_accel: "<Ctrl><Shift>comma",
         label: "Focus Left",
         registers_gtk_accel: false,
         command: ShortcutCommand::FocusLeft,
@@ -540,10 +544,32 @@ const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 50] = [
         id: ShortcutId::FocusRight,
         config_key: "focus_right",
         action_name: "win.focus-right",
-        default_accel: "<Ctrl>Right",
+        default_accel: "<Ctrl><Shift>period",
         label: "Focus Right",
         registers_gtk_accel: false,
         command: ShortcutCommand::FocusRight,
+        scope: ShortcutScope::Window,
+        editable_capture_policy: EditableCapturePolicy::BypassInEditable,
+    },
+    ShortcutDefinition {
+        id: ShortcutId::FocusPanelLeft,
+        config_key: "focus_panel_left",
+        action_name: "win.focus-panel-left",
+        default_accel: "<Ctrl>Left",
+        label: "Focus Panel Left",
+        registers_gtk_accel: false,
+        command: ShortcutCommand::FocusPanelLeft,
+        scope: ShortcutScope::Window,
+        editable_capture_policy: EditableCapturePolicy::BypassInEditable,
+    },
+    ShortcutDefinition {
+        id: ShortcutId::FocusPanelRight,
+        config_key: "focus_panel_right",
+        action_name: "win.focus-panel-right",
+        default_accel: "<Ctrl>Right",
+        label: "Focus Panel Right",
+        registers_gtk_accel: false,
+        command: ShortcutCommand::FocusPanelRight,
         scope: ShortcutScope::Window,
         editable_capture_policy: EditableCapturePolicy::BypassInEditable,
     },
@@ -1048,7 +1074,31 @@ impl NormalizedShortcut {
         if self.cmd {
             parts.push("Cmd".to_string());
         }
-        parts.push(display_key_label(&self.key));
+        parts.push(match self.key.as_str() {
+            "page_up" => "Page Up".to_string(),
+            "page_down" => "Page Down".to_string(),
+            "left" => "Left".to_string(),
+            "right" => "Right".to_string(),
+            "up" => "Up".to_string(),
+            "down" => "Down".to_string(),
+            "enter" => "Enter".to_string(),
+            "escape" => "Esc".to_string(),
+            "tab" => "Tab".to_string(),
+            "comma" => ",".to_string(),
+            "period" => ".".to_string(),
+            key if key.chars().count() == 1 => key.to_ascii_uppercase(),
+            key => key
+                .split('_')
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    let mut chars = part.chars();
+                    chars.next().map_or_else(String::new, |first| {
+                        first.to_ascii_uppercase().to_string() + chars.as_str()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        });
         parts.join("+")
     }
 }
@@ -1681,37 +1731,6 @@ fn runtime_key_to_gtk_key(key: &str) -> String {
     }
 }
 
-fn display_key_label(key: &str) -> String {
-    match key {
-        "page_up" => "Page Up".to_string(),
-        "page_down" => "Page Down".to_string(),
-        "left" => "Left".to_string(),
-        "right" => "Right".to_string(),
-        "up" => "Up".to_string(),
-        "down" => "Down".to_string(),
-        "enter" => "Enter".to_string(),
-        "escape" => "Esc".to_string(),
-        "tab" => "Tab".to_string(),
-        other if other.chars().count() == 1 => other.to_ascii_uppercase(),
-        other => other
-            .split('_')
-            .filter(|part| !part.is_empty())
-            .map(|part| {
-                let mut chars = part.chars();
-                match chars.next() {
-                    Some(first) => {
-                        let mut label = first.to_ascii_uppercase().to_string();
-                        label.push_str(chars.as_str());
-                        label
-                    }
-                    None => String::new(),
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-    }
-}
-
 fn is_function_key(key: &str) -> bool {
     key.strip_prefix('f')
         .map(|suffix| {
@@ -1732,7 +1751,7 @@ mod tests {
 
     #[test]
     fn definitions_cover_current_host_shortcuts() {
-        assert_eq!(definitions().len(), 50);
+        assert_eq!(definitions().len(), 52);
     }
 
     #[test]
@@ -2229,6 +2248,22 @@ mod tests {
         assert_eq!(resolved.command_for_runtime_combo("ctrl+alt+d"), None);
         assert_eq!(resolved.command_for_runtime_combo("ctrl+alt+shift+d"), None);
         assert_eq!(
+            resolved.command_for_runtime_combo("ctrl+shift+comma"),
+            Some(ShortcutCommand::FocusLeft)
+        );
+        assert_eq!(
+            resolved.command_for_runtime_combo("ctrl+shift+period"),
+            Some(ShortcutCommand::FocusRight)
+        );
+        assert_eq!(
+            resolved.command_for_runtime_combo("ctrl+left"),
+            Some(ShortcutCommand::FocusPanelLeft)
+        );
+        assert_eq!(
+            resolved.command_for_runtime_combo("ctrl+right"),
+            Some(ShortcutCommand::FocusPanelRight)
+        );
+        assert_eq!(
             resolved.command_for_runtime_combo("ctrl+9"),
             Some(ShortcutCommand::ActivateLastWorkspace)
         );
@@ -2262,6 +2297,18 @@ mod tests {
                 .default_display_label_for_id(ShortcutId::TerminalPaste)
                 .as_deref(),
             Some("Ctrl+Shift+V")
+        );
+        assert_eq!(
+            resolved
+                .default_display_label_for_id(ShortcutId::FocusLeft)
+                .as_deref(),
+            Some("Ctrl+Shift+,")
+        );
+        assert_eq!(
+            resolved
+                .default_display_label_for_id(ShortcutId::FocusPanelLeft)
+                .as_deref(),
+            Some("Ctrl+Left")
         );
     }
 

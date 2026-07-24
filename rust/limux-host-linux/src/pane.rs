@@ -361,6 +361,12 @@ impl TerminalSplitNode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalFocusDirection {
+    Left,
+    Right,
+}
+
 impl TerminalTabState {
     fn from_tree(tree: TerminalSplitNode, active_leaf_id: Option<String>) -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -555,6 +561,17 @@ impl Drop for TerminalTabInner {
             source.remove();
         }
     }
+}
+
+fn terminal_focus_index(
+    current_index: usize,
+    leaf_count: usize,
+    direction: TerminalFocusDirection,
+) -> Option<usize> {
+    (leaf_count > 1).then(|| match direction {
+        TerminalFocusDirection::Left => (current_index + leaf_count - 1) % leaf_count,
+        TerminalFocusDirection::Right => (current_index + 1) % leaf_count,
+    })
 }
 
 fn build_terminal_split_widget_tree(node: &TerminalSplitNode) -> gtk::Widget {
@@ -1701,6 +1718,52 @@ pub fn split_active_terminal_tab_in_pane(
         &source_leaf,
         orientation,
     )
+}
+
+pub fn focus_active_terminal_in_pane(
+    pane_widget: &gtk::Widget,
+    direction: TerminalFocusDirection,
+) -> bool {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return false;
+    };
+    let terminal_tab_state = {
+        let tab_state = internals.tab_state.borrow();
+        let active_id = tab_state
+            .active_tab
+            .clone()
+            .or_else(|| tab_state.tabs.first().map(|entry| entry.id.clone()));
+        let Some(active_id) = active_id else {
+            return false;
+        };
+        let Some(entry) = tab_state.tabs.iter().find(|entry| entry.id == active_id) else {
+            return false;
+        };
+        let TabKind::Terminal { state } = &entry.kind else {
+            return false;
+        };
+        state.clone()
+    };
+    let active_leaf_id = terminal_tab_state.active_leaf_id();
+    let mut leaves = Vec::new();
+    terminal_tab_state
+        .inner
+        .tree
+        .borrow()
+        .for_each_leaf(|leaf| leaves.push(leaf.clone()));
+    let Some(target_index) = leaves
+        .iter()
+        .position(|leaf| leaf.leaf_id == active_leaf_id)
+        .and_then(|index| terminal_focus_index(index, leaves.len(), direction))
+    else {
+        return false;
+    };
+    let target = &leaves[target_index];
+    if !terminal_tab_state.set_active_leaf(&target.leaf_id) {
+        return false;
+    }
+    target.handle.focus_surface();
+    true
 }
 
 fn make_terminal_callbacks(
@@ -4176,8 +4239,9 @@ mod tests {
     use super::{
         classify_content_drop_zone, content_drop_preview_rect, effective_drop_target_dimensions,
         is_localhost_input, next_active_after_tab_removal, normalize_browser_entry_input,
-        normalize_reorder_insert_index, pane_action_tooltip, surface_hint_matches, ContentDropZone,
-        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        normalize_reorder_insert_index, pane_action_tooltip, surface_hint_matches,
+        terminal_focus_index, ContentDropZone, TabDragPayload, TerminalFocusDirection,
+        BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
         BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
         TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
@@ -4223,6 +4287,30 @@ mod tests {
         assert_eq!(
             pane_action_tooltip(&unbound, "Close pane", Some(ShortcutId::CloseFocusedPane)),
             "Close pane"
+        );
+    }
+
+    #[test]
+    fn terminal_focus_cycles_in_split_tree_order() {
+        assert_eq!(
+            terminal_focus_index(0, 4, TerminalFocusDirection::Right),
+            Some(1)
+        );
+        assert_eq!(
+            terminal_focus_index(1, 4, TerminalFocusDirection::Left),
+            Some(0)
+        );
+        assert_eq!(
+            terminal_focus_index(3, 4, TerminalFocusDirection::Right),
+            Some(0)
+        );
+        assert_eq!(
+            terminal_focus_index(0, 4, TerminalFocusDirection::Left),
+            Some(3)
+        );
+        assert_eq!(
+            terminal_focus_index(0, 1, TerminalFocusDirection::Right),
+            None
         );
     }
 
