@@ -39,6 +39,9 @@ pub const GHOSTTY_MOUSE_LEFT: c_int = 1;
 pub const GHOSTTY_MOUSE_RIGHT: c_int = 2;
 pub const GHOSTTY_MOUSE_MIDDLE: c_int = 3;
 
+pub const GHOSTTY_SCROLL_MODS_NONE: c_int = 0;
+pub const GHOSTTY_SCROLL_MODS_PRECISION: c_int = 1 << 0;
+
 pub const GHOSTTY_ACTION_RELEASE: c_int = 0;
 pub const GHOSTTY_ACTION_PRESS: c_int = 1;
 pub const GHOSTTY_ACTION_REPEAT: c_int = 2;
@@ -187,6 +190,14 @@ pub const GHOSTTY_KEY_F12: c_int = 132;
 // -------------------------------------------------------------------
 // Structs
 // -------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ghostty_config_color_s {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]

@@ -1234,7 +1234,7 @@ const WORKSPACE_RENAME_ENTRY_CSS_CLASSES: [&str; 2] =
 pub(crate) const SPLIT_PANE_CSS_CLASS: &str = "limux-split-pane";
 const SIDEBAR_HANDLE_CSS_CLASS: &str = "limux-sidebar-handle";
 const SIDEBAR_HANDLE_CURSOR_NAME: &str = "col-resize";
-const SIDEBAR_RESIZE_HANDLE_WIDTH_PX: i32 = 3;
+const SIDEBAR_RESIZE_HANDLE_WIDTH_PX: i32 = 2;
 
 const BASE_CSS: &str = r#"
 :root {
@@ -1409,6 +1409,9 @@ row:selected .limux-ws-path {
 .limux-terminal-split-dim {
     background-color: alpha(@window_bg_color, 0.30);
 }
+.limux-terminal-scrollbar-empty slider {
+    opacity: 0;
+}
 .limux-split-pane > separator {
     background-color: alpha(@window_fg_color, 0.16);
     min-width: 2px;
@@ -1418,15 +1421,13 @@ row:selected .limux-ws-path {
     background-color: alpha(@window_fg_color, 0.24);
 }
 .limux-sidebar-handle {
-    min-width: 3px;
+    min-width: 2px;
     background-color: alpha(@window_fg_color, 0.08);
 }
 .limux-sidebar-handle:hover {
     background-color: alpha(@accent_bg_color, 0.45);
 }
 "#;
-
-const CONTENT_BACKGROUND_RGB: (u8, u8, u8) = (23, 23, 23);
 
 // ---------------------------------------------------------------------------
 // Window construction
@@ -1445,8 +1446,7 @@ pub fn build_window(app: &adw::Application) {
         eprintln!("limux: {warning}");
     }
     let config = Rc::new(RefCell::new(loaded_config.config));
-    let background_opacity =
-        sanitize_background_opacity(crate::terminal::ghostty_background_opacity());
+    let (background_rgb, background_opacity) = crate::terminal::ghostty_background();
 
     let shortcuts = Rc::new(shortcut_config::load_shortcuts_for_display(&display));
     for warning in &shortcuts.warnings {
@@ -1457,7 +1457,7 @@ pub fn build_window(app: &adw::Application) {
     let provider = gtk::CssProvider::new();
     let all_css = format!(
         "{}\n{}\n{}\n{}",
-        build_window_css(background_opacity),
+        build_window_css(background_rgb, background_opacity),
         pane::PANE_CSS,
         keybind_editor::KEYBIND_EDITOR_CSS,
         crate::settings_editor::SETTINGS_CSS,
@@ -1822,11 +1822,15 @@ pub fn build_window(app: &adw::Application) {
     window.present();
 }
 
-fn build_window_css(background_opacity: f64) -> String {
+fn build_window_css((r, g, b): (u8, u8, u8), background_opacity: f64) -> String {
     let background_opacity = sanitize_background_opacity(background_opacity);
-    let (r, g, b) = CONTENT_BACKGROUND_RGB;
     format!(
-        "{BASE_CSS}\n.limux-content {{\n    background-color: rgba({r}, {g}, {b}, {background_opacity:.3});\n}}\n"
+        "{BASE_CSS}\n\
+         .limux-content, .limux-terminal-scrollbar {{ background-color: rgba({r}, {g}, {b}, {background_opacity:.3}); }}\n\
+         .limux-terminal-scrollbar, .limux-terminal-scrollbar > range, .limux-terminal-scrollbar > range > trough {{ min-width: 7px; margin: 0; padding: 0; border: 0; }}\n\
+         .limux-terminal-scrollbar > range, .limux-terminal-scrollbar > range > trough {{ background-color: transparent; }}\n\
+         .limux-terminal-scrollbar slider {{ min-width: 5px; margin: 0 1px; border: 0; border-radius: 999px; background-color: alpha(@window_fg_color, 0.35); transition: background-color 120ms ease-out; }}\n\
+         .limux-terminal-scrollbar:hover slider {{ background-color: alpha(@window_fg_color, 0.55); }}\n"
     )
 }
 
@@ -6294,13 +6298,16 @@ mod tests {
     }
 
     #[test]
-    fn build_window_css_uses_resolved_background_opacity() {
-        let css = build_window_css(0.42);
+    fn build_window_css_uses_ghostty_background_and_fixed_scrollbar_lane() {
+        let css = build_window_css((12, 34, 56), 0.42);
         assert!(css.contains(".limux-host-entry"));
         assert!(css.contains(".limux-host-entry text"));
         assert!(css.contains(".limux-host-entry text placeholder"));
         assert!(css.contains(".limux-content"));
-        assert!(css.contains("background-color: rgba(23, 23, 23, 0.420);"));
+        assert!(css.contains("background-color: rgba(12, 34, 56, 0.420);"));
+        assert!(css.contains("min-width: 7px"));
+        assert!(css.contains("margin: 0; padding: 0; border: 0"));
+        assert!(css.contains(".limux-terminal-scrollbar slider { min-width: 5px; margin: 0 1px"));
     }
 
     #[test]

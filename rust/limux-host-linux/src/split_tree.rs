@@ -454,6 +454,7 @@ fn build_widget_tree(node: &SplitNode, state: &State) -> gtk::Widget {
                 .vexpand(true)
                 .build();
             paned.add_css_class(SPLIT_PANE_CSS_CLASS);
+            paned.set_wide_handle(true);
             paned.set_shrink_start_child(false);
             paned.set_shrink_end_child(false);
             paned.set_resize_start_child(true);

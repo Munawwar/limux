@@ -24,6 +24,7 @@ use crate::shortcut_config::NormalizedShortcut;
 
 struct GhosttyState {
     app: ghostty_app_t,
+    background: ghostty_config_color_s,
     background_opacity: f64,
 }
 
@@ -36,6 +37,12 @@ static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIG
 static CURRENT_SCROLLBAR_ENABLED: AtomicBool = AtomicBool::new(true);
 static WAKEUP_IDLE_QUEUED: AtomicBool = AtomicBool::new(false);
 static EMPTY_CLIPBOARD_TEXT: [u8; 1] = [0];
+const SCROLLBAR_EMPTY_CSS_CLASS: &str = "limux-terminal-scrollbar-empty";
+const DEFAULT_BACKGROUND: ghostty_config_color_s = ghostty_config_color_s {
+    r: 0x28,
+    g: 0x2C,
+    b: 0x34,
+};
 
 type TitleChangedCallback = dyn Fn(&str);
 type PwdChangedCallback = dyn Fn(&str);
@@ -84,6 +91,17 @@ struct SurfaceEntry {
 
 struct ClipboardContext {
     surface: Cell<ghostty_surface_t>,
+}
+
+fn sync_scrollbar_presentation(entry: &SurfaceEntry, enabled: bool) {
+    let scrollable = entry.scrollbar_adjustment.upper() > entry.scrollbar_adjustment.page_size();
+    entry.scrollbar.set_visible(enabled);
+    entry.scrollbar.set_can_target(enabled && scrollable);
+    if scrollable {
+        entry.scrollbar.remove_css_class(SCROLLBAR_EMPTY_CSS_CLASS);
+    } else {
+        entry.scrollbar.add_css_class(SCROLLBAR_EMPTY_CSS_CLASS);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -535,6 +553,7 @@ pub fn init_ghostty() {
         }
 
         let config = load_ghostty_config();
+        let background = load_background(config);
         let background_opacity = load_background_opacity(config);
         CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
 
@@ -564,6 +583,7 @@ pub fn init_ghostty() {
 
         GhosttyState {
             app,
+            background,
             background_opacity,
         }
     });
@@ -573,12 +593,30 @@ fn ghostty_app() -> ghostty_app_t {
     GHOSTTY.get().expect("ghostty not initialized").app
 }
 
-pub fn ghostty_background_opacity() -> f64 {
+pub fn ghostty_background() -> ((u8, u8, u8), f64) {
     init_ghostty();
-    GHOSTTY
-        .get()
-        .map(|state| state.background_opacity)
-        .unwrap_or(1.0)
+    let state = GHOSTTY.get().expect("ghostty initialized");
+    (
+        (state.background.r, state.background.g, state.background.b),
+        state.background_opacity,
+    )
+}
+
+fn load_background(config: ghostty_config_t) -> ghostty_config_color_s {
+    let mut background = DEFAULT_BACKGROUND;
+    let key = b"background";
+    if unsafe {
+        ghostty_config_get(
+            config,
+            (&mut background as *mut ghostty_config_color_s).cast::<c_void>(),
+            key.as_ptr().cast::<c_char>(),
+            key.len(),
+        )
+    } {
+        background
+    } else {
+        DEFAULT_BACKGROUND
+    }
 }
 
 fn load_background_opacity(config: ghostty_config_t) -> f64 {
@@ -695,9 +733,9 @@ unsafe extern "C" fn ghostty_action_cb(
                             scrollbar.len as f64,
                         );
                         entry.scrollbar_syncing.set(false);
-                        entry.scrollbar.set_visible(
-                            CURRENT_SCROLLBAR_ENABLED.load(Ordering::Relaxed)
-                                && scrollbar.total > scrollbar.len,
+                        sync_scrollbar_presentation(
+                            entry,
+                            CURRENT_SCROLLBAR_ENABLED.load(Ordering::Relaxed),
                         );
                     }
                 });
@@ -840,7 +878,13 @@ unsafe extern "C" fn ghostty_action_cb(
         }
         GHOSTTY_ACTION_RELOAD_CONFIG => {
             let config = load_ghostty_config();
-            CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
+            let scrollbar_enabled = load_scrollbar_enabled(config);
+            CURRENT_SCROLLBAR_ENABLED.store(scrollbar_enabled, Ordering::Relaxed);
+            SURFACE_MAP.with(|map| {
+                for entry in map.borrow().values() {
+                    sync_scrollbar_presentation(entry, scrollbar_enabled);
+                }
+            });
             match target.tag {
                 GHOSTTY_TARGET_APP => unsafe {
                     ghostty_app_update_config(app, config);
@@ -1187,7 +1231,10 @@ pub fn create_terminal(
 
     let scrollbar_adjustment = gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 0.0, 0.0);
     let scrollbar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&scrollbar_adjustment));
-    scrollbar.set_visible(false);
+    scrollbar.add_css_class("limux-terminal-scrollbar");
+    scrollbar.add_css_class(SCROLLBAR_EMPTY_CSS_CLASS);
+    scrollbar.set_visible(CURRENT_SCROLLBAR_ENABLED.load(Ordering::Relaxed));
+    scrollbar.set_can_target(false);
     scrollbar.set_vexpand(true);
 
     let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -1739,21 +1786,32 @@ pub fn create_terminal(
         gl_area.add_controller(motion);
     }
 
-    // Mouse scroll
+    // Mouse scroll. Capture at the terminal root so scrolling over the GTK
+    // scrollbar follows the same Ghostty speed and precision path.
     {
         let surface_cell = surface_cell.clone();
-        let scroll = gtk::EventControllerScroll::new(
-            gtk::EventControllerScrollFlags::BOTH_AXES | gtk::EventControllerScrollFlags::DISCRETE,
-        );
-        scroll.connect_scroll(move |ctrl, dx, dy| {
+        let precision = Rc::new(Cell::new(false));
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let precision_begin = precision.clone();
+        scroll.connect_scroll_begin(move |_| precision_begin.set(true));
+        let precision_end = precision.clone();
+        scroll.connect_scroll_end(move |_| precision_end.set(false));
+        scroll.connect_scroll(move |_, dx, dy| {
             if let Some(surface) = *surface_cell.borrow() {
-                let mods = translate_mouse_mods(ctrl.current_event_state());
+                let (mods, multiplier) = if precision.get() {
+                    (GHOSTTY_SCROLL_MODS_PRECISION, 10.0)
+                } else {
+                    (GHOSTTY_SCROLL_MODS_NONE, 1.0)
+                };
                 // GTK and Ghostty use opposite scroll conventions — negate both axes
-                unsafe { ghostty_surface_mouse_scroll(surface, -dx, -dy, mods) };
+                unsafe {
+                    ghostty_surface_mouse_scroll(surface, -dx * multiplier, -dy * multiplier, mods)
+                };
             }
             glib::Propagation::Stop
         });
-        gl_area.add_controller(scroll);
+        root.add_controller(scroll);
     }
 
     // Focus
