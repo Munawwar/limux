@@ -196,7 +196,6 @@ type PaneBellCallback = dyn Fn(bool, u32, &str);
 type PanePathCallback = dyn Fn(&str);
 type PaneDesktopNotificationCallback = dyn Fn(&str, &str, bool, u32, &str);
 type PaneEmptyCallback = dyn Fn(&gtk::Widget, PaneEmptyReason);
-type PaneOpenBrowserHereCallback = dyn Fn(&gtk::Widget);
 type PaneShortcutStateCallback = dyn Fn() -> Rc<ResolvedShortcutConfig>;
 type PaneShortcutCaptureCallback =
     dyn Fn(ShortcutId, Option<NormalizedShortcut>) -> Result<ResolvedShortcutConfig, String>;
@@ -213,8 +212,6 @@ pub struct PaneCallbacks {
     pub on_close_pane: Box<PaneWidgetCallback>,
     pub on_bell: Box<PaneBellCallback>,
     pub on_desktop_notification: Box<PaneDesktopNotificationCallback>,
-    pub on_open_browser_here: Box<PaneOpenBrowserHereCallback>,
-    pub on_open_keybinds: Box<PaneWidgetCallback>,
     pub current_shortcuts: Box<PaneShortcutStateCallback>,
     pub on_capture_shortcut: Rc<PaneShortcutCaptureCallback>,
     pub on_pwd_changed: Box<PanePathCallback>,
@@ -1530,16 +1527,10 @@ fn placeholder_terminal_callbacks() -> TerminalCallbacks {
         on_focus: Box::new(|| {}),
         on_close: Box::new(|| {}),
         on_open_url: Box::new(|_, _| {}),
-        on_open_browser_here: Box::new(|| {}),
         on_split_right: Box::new(|| {}),
         on_split_down: Box::new(|| {}),
         on_split_panel_right: Box::new(|| {}),
         on_split_panel_down: Box::new(|| {}),
-        on_open_keybinds: Box::new(|_| {}),
-        identity: Box::new(|| terminal::TerminalIdentity {
-            workspace_id: None,
-            surface_id: String::new(),
-        }),
     }
 }
 
@@ -1781,11 +1772,8 @@ fn make_terminal_callbacks(
     let callbacks_for_bell = internals.callbacks.clone();
     let callbacks_for_pwd = internals.callbacks.clone();
     let callbacks_for_close = internals.callbacks.clone();
-    let callbacks_for_browser_here = internals.callbacks.clone();
     let callbacks_for_split_panel_right = internals.callbacks.clone();
     let callbacks_for_split_panel_down = internals.callbacks.clone();
-    let callbacks_for_keybinds = internals.callbacks.clone();
-    let callbacks_for_identity = internals.callbacks.clone();
     let tab_strip = internals.tab_strip.clone();
     let content_stack = internals.content_stack.clone();
     let tab_state = internals.tab_state.clone();
@@ -1884,13 +1872,6 @@ fn make_terminal_callbacks(
                 add_browser_tab_to_pane_with_uri(&pane_widget, Some(url));
             }
         }),
-        on_open_browser_here: Box::new({
-            let pane_outer = internals.pane_outer.clone();
-            move || {
-                let pane_widget: gtk::Widget = pane_outer.clone().upcast();
-                (callbacks_for_browser_here.on_open_browser_here)(&pane_widget);
-            }
-        }),
         on_split_right: Box::new({
             let internals = internals.clone();
             let title_label = title_label.clone();
@@ -1952,24 +1933,6 @@ fn make_terminal_callbacks(
             move || {
                 let pane_widget: gtk::Widget = pane_outer.clone().upcast();
                 (callbacks_for_split_panel_down.on_split)(&pane_widget, gtk::Orientation::Vertical);
-            }
-        }),
-        on_open_keybinds: Box::new({
-            let pane_outer = internals.pane_outer.clone();
-            move |_anchor| {
-                let pane_widget: gtk::Widget = pane_outer.clone().upcast();
-                (callbacks_for_keybinds.on_open_keybinds)(&pane_widget);
-            }
-        }),
-        identity: Box::new({
-            let pane_outer = internals.pane_outer.clone();
-            let surface_id = terminal_surface_id(internals.pane_id, tab_id, &leaf.leaf_id);
-            move || {
-                let pane_widget: gtk::Widget = pane_outer.clone().upcast();
-                terminal::TerminalIdentity {
-                    workspace_id: (callbacks_for_identity.workspace_for_pane)(&pane_widget),
-                    surface_id: surface_id.clone(),
-                }
             }
         }),
     }
@@ -2226,7 +2189,6 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
     }
 }
 
-// Public wrappers for keyboard shortcut use
 #[allow(dead_code)]
 pub fn add_terminal_tab_to_pane(pane_widget: &gtk::Widget) {
     if let Some(internals) = find_pane_internals(pane_widget) {
@@ -2250,41 +2212,6 @@ pub fn add_browser_tab_to_pane_with_uri(pane_widget: &gtk::Widget, uri: Option<&
             uri: Some(uri),
         });
         add_browser_tab_inner(&internals, options);
-    }
-}
-
-pub fn add_keybind_editor_tab_to_pane(
-    pane_widget: &gtk::Widget,
-    shortcuts: Rc<ResolvedShortcutConfig>,
-    on_capture: Rc<PaneShortcutCaptureCallback>,
-) {
-    if let Some(internals) = find_pane_internals(pane_widget) {
-        if let Some(existing_id) = internals
-            .tab_state
-            .borrow()
-            .tabs
-            .iter()
-            .find(|entry| matches!(entry.kind, TabKind::Keybinds))
-            .map(|entry| entry.id.clone())
-        {
-            activate_tab(
-                &internals.tab_strip,
-                &internals.content_stack,
-                &internals.tab_state,
-                &existing_id,
-            );
-            (internals.callbacks.on_state_changed)();
-            return;
-        }
-
-        add_keybind_editor_tab_inner(
-            &internals,
-            KeybindsTabInput {
-                shortcuts,
-                on_capture,
-                options: None,
-            },
-        );
     }
 }
 

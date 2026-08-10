@@ -2917,23 +2917,6 @@ fn apply_appearance(
     sync_ghostty_color_scheme_for_config(style_manager, system_prefers_dark, appearance);
 }
 
-fn open_keybind_editor_tab(state: &State, pane_widget: &gtk::Widget) {
-    let shortcuts = {
-        let s = state.borrow();
-        s.shortcuts.clone()
-    };
-    let on_capture: Rc<
-        dyn Fn(
-            ShortcutId,
-            Option<shortcut_config::NormalizedShortcut>,
-        ) -> Result<ResolvedShortcutConfig, String>,
-    > = {
-        let state = state.clone();
-        Rc::new(move |id, binding| persist_shortcut_binding(&state, id, binding))
-    };
-    pane::add_keybind_editor_tab_to_pane(pane_widget, shortcuts, on_capture);
-}
-
 fn activate_workspace_shortcut(state: &State, idx: usize) {
     let row_and_list = {
         let s = state.borrow();
@@ -4707,7 +4690,6 @@ pub(crate) fn create_pane_for_workspace(
     let state_for_close = state.clone();
     let state_for_bell = state.clone();
     let state_for_desktop_notification = state.clone();
-    let state_for_keybinds = state.clone();
     let state_for_pwd = state.clone();
     let state_for_empty = state.clone();
     let ws_id_split = ws_id.to_string();
@@ -4781,12 +4763,6 @@ pub(crate) fn create_pane_for_workspace(
                 });
             },
         ),
-        on_open_browser_here: Box::new(move |pane_widget| {
-            pane::add_browser_tab_to_pane(pane_widget);
-        }),
-        on_open_keybinds: Box::new(move |anchor| {
-            open_keybind_editor_tab(&state_for_keybinds, anchor);
-        }),
         current_shortcuts: Box::new({
             let state = state.clone();
             move || {

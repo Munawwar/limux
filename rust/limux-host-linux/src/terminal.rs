@@ -12,7 +12,6 @@ use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use limux_ghostty_sys::*;
 
@@ -50,14 +49,6 @@ type DesktopNotificationCallback = dyn Fn(&str, &str, bool);
 type BellCallback = dyn Fn(bool);
 type OpenUrlCallback = dyn Fn(&str, bool);
 type VoidCallback = dyn Fn();
-type WidgetCallback = dyn Fn(&gtk::Widget);
-type IdentityCallback = dyn Fn() -> TerminalIdentity;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TerminalIdentity {
-    pub workspace_id: Option<String>,
-    pub surface_id: String,
-}
 
 pub(crate) struct HoverFocusGuard;
 
@@ -1143,13 +1134,10 @@ pub struct TerminalCallbacks {
     pub on_focus: Box<VoidCallback>,
     pub on_close: Box<VoidCallback>,
     pub on_open_url: Box<OpenUrlCallback>,
-    pub on_open_browser_here: Box<VoidCallback>,
     pub on_split_right: Box<VoidCallback>,
     pub on_split_down: Box<VoidCallback>,
     pub on_split_panel_right: Box<VoidCallback>,
     pub on_split_panel_down: Box<VoidCallback>,
-    pub on_open_keybinds: Box<WidgetCallback>,
-    pub identity: Box<IdentityCallback>,
 }
 
 pub struct TerminalOptions {
@@ -1745,12 +1733,11 @@ pub fn create_terminal(
         let sc = surface_cell.clone();
         let callbacks = callbacks.clone();
         let gl = gl_area.clone();
-        let overlay = overlay.clone();
         let right_click = gtk::GestureClick::new();
         right_click.set_button(3);
         right_click.connect_pressed(move |gesture, _n, x, y| {
             let surface = *sc.borrow();
-            show_terminal_context_menu(&gl, &overlay, surface, &callbacks, x, y);
+            show_terminal_context_menu(&gl, surface, &callbacks, x, y);
             gesture.set_state(gtk::EventSequenceState::Claimed);
         });
         gl_area.add_controller(right_click);
@@ -1945,16 +1932,47 @@ fn surface_action(surface: Option<ghostty_surface_t>, action: &str) {
     }
 }
 
-fn copy_text_to_clipboards(text: &str) {
-    if let Some(display) = gtk::gdk::Display::default() {
-        display.clipboard().set_text(text);
-        display.primary_clipboard().set_text(text);
-    }
+fn context_submenu(labels: &[&str]) -> (gtk::Popover, Vec<gtk::Button>) {
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(false);
+    popover.set_position(gtk::PositionType::Right);
+    let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    menu_box.set_margin_top(4);
+    menu_box.set_margin_bottom(4);
+    menu_box.set_margin_start(4);
+    menu_box.set_margin_end(4);
+    let buttons = labels
+        .iter()
+        .map(|label| {
+            let button = gtk::Button::with_label(label);
+            button.add_css_class("flat");
+            button.set_halign(gtk::Align::Fill);
+            if let Some(label) = button
+                .child()
+                .and_then(|child| child.downcast::<gtk::Label>().ok())
+            {
+                label.set_xalign(0.0);
+            }
+            menu_box.append(&button);
+            button
+        })
+        .collect();
+    popover.set_child(Some(&menu_box));
+    (popover, buttons)
+}
+
+fn attach_context_submenu(button: &gtk::Button, popover: &gtk::Popover) {
+    popover.set_parent(button);
+    let popover_for_motion = popover.clone();
+    let motion = gtk::EventControllerMotion::new();
+    motion.connect_enter(move |_, _, _| popover_for_motion.popup());
+    button.add_controller(motion);
+    let popover = popover.clone();
+    button.connect_clicked(move |_| popover.popup());
 }
 
 fn show_terminal_context_menu(
     gl_area: &gtk::GLArea,
-    overlay: &gtk::Overlay,
     surface: Option<ghostty_surface_t>,
     callbacks: &Rc<RefCell<TerminalCallbacks>>,
     x: f64,
@@ -1965,6 +1983,7 @@ fn show_terminal_context_menu(
     menu_box.set_margin_bottom(4);
     menu_box.set_margin_start(4);
     menu_box.set_margin_end(4);
+    let popover = gtk::Popover::new();
 
     let has_selection = surface
         .map(|s| unsafe { ghostty_surface_has_selection(s) })
@@ -1974,40 +1993,31 @@ fn show_terminal_context_menu(
         ("Copy", has_selection),
         ("Paste", true),
         ("---", false),
-        ("IDs", true),
-        ("---", false),
-        ("Browser", true),
         ("Split Right", true),
         ("Split Down", true),
-        ("Split Panel Right", true),
-        ("Split Panel Down", true),
-        ("Keybinds", true),
+        ("Split Panel", true),
         ("---", false),
         ("Clear", true),
     ];
 
-    let identity = (callbacks.borrow().identity)();
-    let ids_popover = gtk::Popover::new();
-    ids_popover.set_has_arrow(false);
-    ids_popover.set_position(gtk::PositionType::Right);
-    let ids_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    ids_box.set_margin_top(4);
-    ids_box.set_margin_bottom(4);
-    ids_box.set_margin_start(4);
-    ids_box.set_margin_end(4);
-    let copy_workspace_btn = gtk::Button::with_label("Copy Workspace ID");
-    copy_workspace_btn.add_css_class("flat");
-    copy_workspace_btn.set_sensitive(identity.workspace_id.is_some());
-    let copy_surface_btn = gtk::Button::with_label("Copy Surface ID");
-    copy_surface_btn.add_css_class("flat");
-    for btn in [&copy_workspace_btn, &copy_surface_btn] {
-        btn.set_halign(gtk::Align::Fill);
-        if let Some(lbl) = btn.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
-            lbl.set_xalign(0.0);
-        }
-        ids_box.append(btn);
+    let (split_panel_popover, split_panel_buttons) = context_submenu(&["Right", "Down"]);
+    for (btn, split_right) in split_panel_buttons.into_iter().zip([true, false]) {
+        let split_panel_popover = split_panel_popover.clone();
+        let popover = popover.clone();
+        let callbacks = callbacks.clone();
+        btn.connect_clicked(move |_| {
+            {
+                let callbacks = callbacks.borrow();
+                if split_right {
+                    (callbacks.on_split_panel_right)();
+                } else {
+                    (callbacks.on_split_panel_down)();
+                }
+            }
+            split_panel_popover.popdown();
+            popover.popdown();
+        });
     }
-    ids_popover.set_child(Some(&ids_box));
 
     for (label, enabled) in &items {
         if *label == "---" {
@@ -2018,30 +2028,23 @@ fn show_terminal_context_menu(
             continue;
         }
 
-        let btn = gtk::Button::with_label(if *label == "IDs" { "IDs >" } else { label });
+        let btn = gtk::Button::with_label(if *label == "Split Panel" {
+            "Split Panel >"
+        } else {
+            label
+        });
         btn.add_css_class("flat");
         btn.set_sensitive(*enabled);
         btn.set_halign(gtk::Align::Fill);
         if let Some(lbl) = btn.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
             lbl.set_xalign(0.0);
         }
-        if *label == "IDs" {
-            ids_popover.set_parent(&btn);
-            let ids_popover_for_motion = ids_popover.clone();
-            let motion = gtk::EventControllerMotion::new();
-            motion.connect_enter(move |_, _, _| {
-                ids_popover_for_motion.popup();
-            });
-            btn.add_controller(motion);
-            let ids_popover_for_click = ids_popover.clone();
-            btn.connect_clicked(move |_| {
-                ids_popover_for_click.popup();
-            });
+        if *label == "Split Panel" {
+            attach_context_submenu(&btn, &split_panel_popover);
         }
         menu_box.append(&btn);
     }
 
-    let popover = gtk::Popover::new();
     popover.set_child(Some(&menu_box));
     popover.set_parent(gl_area);
     popover.set_has_arrow(false);
@@ -2054,20 +2057,15 @@ fn show_terminal_context_menu(
             let label = btn.label().unwrap_or_default().to_string();
             let pop = popover.clone();
             let cb = callbacks.clone();
-            let gl_area = gl_area.clone();
 
             btn.connect_clicked(move |_| {
-                if label == "IDs >" {
+                if label == "Split Panel >" {
                     return;
                 }
                 pop.popdown();
                 match label.as_str() {
                     "Copy" => surface_action(surface, "copy_to_clipboard"),
                     "Paste" => surface_action(surface, "paste_from_clipboard"),
-                    "Browser" => {
-                        let callbacks = cb.borrow();
-                        (callbacks.on_open_browser_here)();
-                    }
                     "Split Right" => {
                         let callbacks = cb.borrow();
                         (callbacks.on_split_right)();
@@ -2075,22 +2073,6 @@ fn show_terminal_context_menu(
                     "Split Down" => {
                         let callbacks = cb.borrow();
                         (callbacks.on_split_down)();
-                    }
-                    "Split Panel Right" => {
-                        let callbacks = cb.borrow();
-                        (callbacks.on_split_panel_right)();
-                    }
-                    "Split Panel Down" => {
-                        let callbacks = cb.borrow();
-                        (callbacks.on_split_panel_down)();
-                    }
-                    "Keybinds" => {
-                        let anchor: gtk::Widget = gl_area.clone().upcast();
-                        let cb = cb.clone();
-                        glib::timeout_add_local_once(Duration::from_millis(80), move || {
-                            let callbacks = cb.borrow();
-                            (callbacks.on_open_keybinds)(&anchor);
-                        });
                     }
                     "Clear" => surface_action(surface, "clear_screen"),
                     _ => {}
@@ -2101,37 +2083,9 @@ fn show_terminal_context_menu(
     }
 
     {
-        let pop = popover.clone();
-        let ids_pop = ids_popover.clone();
-        let overlay = overlay.clone();
-        let workspace_id = identity.workspace_id.clone();
-        copy_workspace_btn.connect_clicked(move |_| {
-            if let Some(workspace_id) = workspace_id.as_deref() {
-                copy_text_to_clipboards(workspace_id);
-                show_clipboard_toast(&overlay);
-            }
-            ids_pop.popdown();
-            pop.popdown();
-        });
-    }
-
-    {
-        let pop = popover.clone();
-        let ids_pop = ids_popover.clone();
-        let overlay = overlay.clone();
-        let surface_id = identity.surface_id.clone();
-        copy_surface_btn.connect_clicked(move |_| {
-            copy_text_to_clipboards(&surface_id);
-            show_clipboard_toast(&overlay);
-            ids_pop.popdown();
-            pop.popdown();
-        });
-    }
-
-    {
-        let ids_popover = ids_popover.clone();
+        let split_panel_popover = split_panel_popover.clone();
         popover.connect_closed(move |p| {
-            ids_popover.popdown();
+            split_panel_popover.popdown();
             p.unparent();
         });
     }
