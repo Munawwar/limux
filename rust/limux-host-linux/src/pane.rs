@@ -241,6 +241,7 @@ struct TerminalTabInner {
 #[derive(Clone)]
 struct TerminalLeafState {
     leaf_id: String,
+    surface_id: String,
     cwd: Rc<RefCell<Option<String>>>,
     agent: Rc<RefCell<Option<RestorableAgentState>>>,
     handle: terminal::TerminalHandle,
@@ -333,6 +334,9 @@ impl TerminalSplitNode {
     fn snapshot(&self) -> layout_state::TerminalTreeState {
         match self {
             Self::Leaf(leaf) => {
+                if let Some(cwd) = crate::process_cwd::surface_cwd(&leaf.surface_id) {
+                    *leaf.cwd.borrow_mut() = Some(cwd);
+                }
                 layout_state::TerminalTreeState::Leaf(layout_state::TerminalLeafState {
                     leaf_id: Some(leaf.leaf_id.clone()),
                     cwd: leaf.cwd.borrow().clone(),
@@ -1518,6 +1522,13 @@ fn terminal_surface_id(pane_id: u32, tab_id: &str, leaf_id: &str) -> String {
     format!("{pane_id}:{tab_id}:{leaf_id}")
 }
 
+fn resolve_terminal_working_directory<'a>(
+    cwd: Option<&'a str>,
+    fallback: Option<&'a str>,
+) -> Option<&'a str> {
+    cwd.or(fallback)
+}
+
 fn placeholder_terminal_callbacks() -> TerminalCallbacks {
     TerminalCallbacks {
         on_title_changed: Box::new(|_| {}),
@@ -1534,34 +1545,6 @@ fn placeholder_terminal_callbacks() -> TerminalCallbacks {
     }
 }
 
-fn build_terminal_extra_env(
-    internals: &Rc<PaneInternals>,
-    tab_id: &str,
-    leaf_id: &str,
-) -> Vec<(String, String)> {
-    let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
-    let workspace_id = (internals.callbacks.workspace_for_pane)(&pane_widget);
-    let mut extra_env = Vec::new();
-    if let Some(workspace_id) = workspace_id {
-        extra_env.push(("LIMUX_WORKSPACE_ID".to_string(), workspace_id));
-    }
-    extra_env.push((
-        "LIMUX_SURFACE_ID".to_string(),
-        terminal_surface_id(internals.pane_id, tab_id, leaf_id),
-    ));
-    extra_env.push(("LIMUX_PANE_ID".to_string(), internals.pane_id.to_string()));
-    extra_env.push(("LIMUX_TAB_ID".to_string(), tab_id.to_string()));
-    if let Some(sock) = limux_control::socket_path::resolve_socket_path(
-        None,
-        limux_control::socket_path::SocketMode::Runtime,
-    )
-    .to_str()
-    {
-        extra_env.push(("LIMUX_SOCKET".to_string(), sock.to_string()));
-    }
-    extra_env
-}
-
 fn create_terminal_leaf(
     internals: &Rc<PaneInternals>,
     tab_id: &str,
@@ -1570,10 +1553,26 @@ fn create_terminal_leaf(
     cwd: Option<&str>,
     agent: Option<RestorableAgentState>,
 ) -> TerminalLeafState {
-    let term_cwd = Rc::new(RefCell::new(
-        cwd.map(|cwd| cwd.to_string())
-            .or_else(|| working_directory.map(|cwd| cwd.to_string())),
-    ));
+    let working_directory = resolve_terminal_working_directory(cwd, working_directory);
+    let surface_id = terminal_surface_id(internals.pane_id, tab_id, leaf_id);
+    let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
+    let mut extra_env = vec![
+        ("LIMUX_SURFACE_ID".to_string(), surface_id.clone()),
+        ("LIMUX_PANE_ID".to_string(), internals.pane_id.to_string()),
+        ("LIMUX_TAB_ID".to_string(), tab_id.to_string()),
+    ];
+    if let Some(workspace_id) = (internals.callbacks.workspace_for_pane)(&pane_widget) {
+        extra_env.push(("LIMUX_WORKSPACE_ID".to_string(), workspace_id));
+    }
+    if let Some(socket) = limux_control::socket_path::resolve_socket_path(
+        None,
+        limux_control::socket_path::SocketMode::Runtime,
+    )
+    .to_str()
+    {
+        extra_env.push(("LIMUX_SOCKET".to_string(), socket.to_string()));
+    }
+    let term_cwd = Rc::new(RefCell::new(working_directory.map(str::to_string)));
     let term_agent = Rc::new(RefCell::new(agent.clone()));
     let hover_focus = {
         let callbacks = internals.callbacks.clone();
@@ -1597,12 +1596,13 @@ fn create_terminal_leaf(
             hover_focus,
             saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
             startup_command,
-            extra_env: build_terminal_extra_env(internals, tab_id, leaf_id),
+            extra_env,
         },
         placeholder_terminal_callbacks(),
     );
     TerminalLeafState {
         leaf_id: leaf_id.to_string(),
+        surface_id,
         cwd: term_cwd,
         agent: term_agent,
         handle: term.handle,
@@ -1623,7 +1623,7 @@ fn runtime_terminal_tree_from_layout(
                 tab_id,
                 leaf.leaf_id.as_deref().unwrap_or("leaf-0"),
                 working_directory,
-                leaf.cwd.as_deref().or(working_directory),
+                leaf.cwd.as_deref(),
                 leaf.agent.clone(),
             ))
         }
@@ -1966,10 +1966,7 @@ fn add_terminal_tab_inner(
                 &tab_id,
                 "leaf-0",
                 working_directory,
-                options
-                    .as_ref()
-                    .and_then(|value| value.cwd)
-                    .or(working_directory),
+                options.as_ref().and_then(|value| value.cwd),
                 options.as_ref().and_then(|value| value.agent.clone()),
             ))
         });
@@ -2258,12 +2255,15 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
         .iter()
         .map(|entry| {
             let content = match &entry.kind {
-                TabKind::Terminal { state } => TabContentState::Terminal {
-                    cwd: state.active_cwd(),
-                    agent: state.active_agent(),
-                    tree: Some(Box::new(state.snapshot_tree())),
-                    active_leaf_id: Some(state.active_leaf_id()),
-                },
+                TabKind::Terminal { state } => {
+                    let tree = state.snapshot_tree();
+                    TabContentState::Terminal {
+                        cwd: state.active_cwd(),
+                        agent: state.active_agent(),
+                        tree: Some(Box::new(tree)),
+                        active_leaf_id: Some(state.active_leaf_id()),
+                    }
+                }
                 TabKind::Browser { state } => TabContentState::Browser {
                     uri: state.uri.borrow().clone(),
                 },
@@ -4167,9 +4167,9 @@ mod tests {
     use super::{
         classify_content_drop_zone, content_drop_preview_rect, effective_drop_target_dimensions,
         is_localhost_input, next_active_after_tab_removal, normalize_browser_entry_input,
-        normalize_reorder_insert_index, pane_action_tooltip, surface_hint_matches,
-        terminal_focus_index, ContentDropZone, TabDragPayload, TerminalFocusDirection,
-        BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        normalize_reorder_insert_index, pane_action_tooltip, resolve_terminal_working_directory,
+        surface_hint_matches, terminal_focus_index, ContentDropZone, TabDragPayload,
+        TerminalFocusDirection, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
         BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
         TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
@@ -4178,6 +4178,18 @@ mod tests {
         env_value_contains_token, is_kde_wayland_session_from_env, BROWSER_WEB_VIEW_CSS_CLASS,
     };
     use crate::shortcut_config::{default_shortcuts, resolve_shortcuts_from_str, ShortcutId};
+
+    #[test]
+    fn terminal_leaf_cwd_overrides_workspace_fallback() {
+        assert_eq!(
+            resolve_terminal_working_directory(Some("/leaf"), Some("/workspace")),
+            Some("/leaf")
+        );
+        assert_eq!(
+            resolve_terminal_working_directory(None, Some("/workspace")),
+            Some("/workspace")
+        );
+    }
 
     #[test]
     fn pane_action_tooltip_reflects_remaps_and_unbinds() {

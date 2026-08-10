@@ -4,6 +4,7 @@ mod ghostty_config;
 mod keybind_editor;
 mod layout_state;
 mod pane;
+mod process_cwd;
 mod settings_editor;
 mod shortcut_config;
 mod split_tree;

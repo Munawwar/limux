@@ -167,6 +167,30 @@ done
 
 [ -S "$SOCKET" ] || { echo "FAIL: socket $SOCKET never appeared"; exit 1; }
 
+# --- 5. Stage 1b: terminal cwd persistence -------------------------------
+echo
+echo "== stage 1b: terminal cwd reaches the persisted session =="
+CWD_TARGET="$DEMO_DIR/terminal-cwd"
+mkdir -p "$CWD_TARGET"
+"$LIMUX_CLI" new-pane \
+  --workspace 00000000-0000-4000-8000-000000000001 \
+  --surface 1:terminal-0:leaf-0 \
+  --direction right \
+  --command "cd '$CWD_TARGET'; exec /bin/bash" >/dev/null
+sleep 0.25
+"$LIMUX_CLI" rename-workspace \
+  --workspace 00000000-0000-4000-8000-000000000001 \
+  limux-cwd-test >/dev/null
+
+for _ in $(seq 1 20); do
+  grep -Fq "\"cwd\": \"$CWD_TARGET\"" "$XDG_DATA_HOME/limux/session.json" && break
+  sleep 0.25
+done
+
+grep -Fq "\"cwd\": \"$CWD_TARGET\"" "$XDG_DATA_HOME/limux/session.json" \
+  || { echo "FAIL: terminal cwd was not persisted"; exit 1; }
+echo "stage 1b: OK"
+
 # --- 5. Stage 2: live agent-team ------------------------------------------
 echo
 echo "== stage 2: agent-team against live host (--no-launch) =="

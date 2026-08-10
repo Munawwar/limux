@@ -1807,6 +1807,7 @@ pub fn build_window(app: &adw::Application) {
                     glib::Propagation::Proceed
                 }
                 WindowCloseAction::Confirm => {
+                    save_session_now(&state);
                     request_window_close_confirmation(&state);
                     glib::Propagation::Stop
                 }
