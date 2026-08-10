@@ -1500,10 +1500,10 @@ pub fn build_window(app: &adw::Application) {
         }
     }
 
-    let title = format!("Limux v{}", crate::VERSION);
+    let title = "Limux";
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title(&title)
+        .title(title)
         .default_width(1400)
         .default_height(900)
         .build();
@@ -1523,7 +1523,7 @@ pub fn build_window(app: &adw::Application) {
         None
     } else {
         let bar = adw::HeaderBar::new();
-        bar.set_title_widget(Some(&gtk::Label::builder().label(&title).build()));
+        bar.set_title_widget(Some(&gtk::Label::builder().label(title).build()));
         Some(bar)
     };
 
