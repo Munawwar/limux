@@ -1058,27 +1058,6 @@ fn sidebar_is_visible(state: &AppState) -> bool {
     state.sidebar_shell.is_visible() && sidebar_width(&state.sidebar_shell) > 10
 }
 
-fn begin_window_move_from_widget(
-    widget: &impl IsA<gtk::Widget>,
-    window: &adw::ApplicationWindow,
-    device: &gtk::gdk::Device,
-    button: i32,
-    x: f64,
-    y: f64,
-    timestamp: u32,
-) {
-    let Some((surface_x, surface_y)) = widget.translate_coordinates(window, x, y) else {
-        return;
-    };
-    let Some(surface) = window.surface() else {
-        return;
-    };
-    let Ok(toplevel) = surface.dynamic_cast::<gtk::gdk::Toplevel>() else {
-        return;
-    };
-    toplevel.begin_move(device, button, surface_x, surface_y, timestamp);
-}
-
 fn split_ratio_state(paned: &gtk::Paned) -> Option<Rc<RefCell<f64>>> {
     unsafe {
         paned
@@ -1581,22 +1560,30 @@ pub fn build_window(app: &adw::Application) {
         .build();
     sidebar_title.append(&sidebar_title_label);
 
-    {
-        let window = window.clone();
-        let drag_title = sidebar_title.clone();
-        let drag = gtk::GestureClick::new();
-        drag.set_button(1);
-        drag.connect_pressed(move |gesture, _, x, y| {
-            let Some(device) = gesture.current_event_device() else {
-                return;
-            };
-            let button = gesture.current_button() as i32;
-            let timestamp = gesture.current_event_time();
-            begin_window_move_from_widget(&drag_title, &window, &device, button, x, y, timestamp);
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-        });
-        sidebar_title.add_controller(drag);
-    }
+    let drag = gtk::GestureClick::new();
+    drag.set_button(1);
+    drag.connect_pressed(move |gesture, _, _, _| {
+        let Some(event) = gesture.current_event() else {
+            return;
+        };
+        let (Some(device), Some((surface_x, surface_y)), Some(surface)) =
+            (event.device(), event.position(), event.surface())
+        else {
+            return;
+        };
+        let Ok(toplevel) = surface.dynamic_cast::<gtk::gdk::Toplevel>() else {
+            return;
+        };
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        toplevel.begin_move(
+            &device,
+            gesture.current_button() as i32,
+            surface_x,
+            surface_y,
+            event.time(),
+        );
+    });
+    sidebar_title.add_controller(drag);
 
     let new_ws_btn = gtk::Button::builder()
         .label("New Workspace")
