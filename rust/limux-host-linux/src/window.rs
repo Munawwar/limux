@@ -1786,7 +1786,7 @@ pub fn build_window(app: &adw::Application) {
                 if payload.contains(':') {
                     return create_workspace_for_tab(&state, &payload);
                 }
-                close_workspace_by_id(&state, &payload);
+                request_workspace_close_confirmation(&state, &payload);
                 return true;
             }
             false
@@ -3141,8 +3141,7 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
         let pop = popover.clone();
         delete_btn.connect_clicked(move |_| {
             pop.popdown();
-            close_workspace_by_id(&state, &ws_id);
-            request_session_save(&state);
+            request_workspace_close_confirmation(&state, &ws_id);
         });
     }
     {
@@ -4721,7 +4720,7 @@ pub(crate) fn create_pane_for_workspace(
             );
         }),
         on_close_pane: Box::new(move |pane_widget| {
-            remove_pane_internal(&state_for_close, &ws_id_close, pane_widget, true);
+            request_pane_close_confirmation(&state_for_close, &ws_id_close, pane_widget);
         }),
         on_bell: Box::new(move |source_focused: bool, pane_id: u32, tab_id: &str| {
             // Defer to avoid RefCell borrow conflicts — bell can fire during state mutation
@@ -4853,7 +4852,7 @@ fn close_workspace(state: &State) {
         s.active_workspace().map(|w| w.id.clone())
     };
     if let Some(id) = id {
-        close_workspace_by_id(state, &id);
+        request_workspace_close_confirmation(state, &id);
     }
 }
 
@@ -4876,6 +4875,11 @@ fn close_workspace_by_id_internal(
         .or_else(|| s.active_workspace().map(|workspace| workspace.id.clone()));
 
     let ws = s.workspaces.remove(idx);
+    let mut panes = Vec::new();
+    collect_leaf_panes(&ws.root, &mut panes);
+    for pane_widget in panes {
+        pane::close_processes(&pane_widget);
+    }
     s.stack.remove(&ws.root);
     s.sidebar_list.remove(&ws.sidebar_row);
 
@@ -5215,10 +5219,6 @@ fn split_pane(
     Some(new_pane.upcast())
 }
 
-fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
-    remove_pane_internal(state, ws_id, pane_widget, true);
-}
-
 fn remove_pane_internal(state: &State, ws_id: &str, pane_widget: &gtk::Widget, persist: bool) {
     let container = {
         let s = state.borrow();
@@ -5237,6 +5237,7 @@ fn remove_pane_internal(state: &State, ws_id: &str, pane_widget: &gtk::Widget, p
     }
 
     // Mutate the data model and trigger async widget tree rebuild
+    pane::close_processes(pane_widget);
     container.remove(pane_widget);
 
     if persist {
@@ -5362,6 +5363,57 @@ fn request_window_close_confirmation(state: &State) {
         if should_close {
             let window = state.borrow().window.clone();
             window.close();
+        }
+    });
+}
+
+fn request_workspace_close_confirmation(state: &State, workspace_id: &str) {
+    let (window, name) = {
+        let s = state.borrow();
+        let Some(workspace) = s
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+        else {
+            return;
+        };
+        (s.window.clone(), workspace.name.clone())
+    };
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message(format!("Close workspace “{name}”?"))
+        .detail("All terminals and running processes in this workspace will be closed.")
+        .build();
+    dialog.set_buttons(&["Cancel", "Close Workspace"]);
+    dialog.set_default_button(0);
+    dialog.set_cancel_button(0);
+
+    let state = state.clone();
+    let workspace_id = workspace_id.to_string();
+    dialog.choose(Some(&window), None::<&gio::Cancellable>, move |response| {
+        if response.ok() == Some(1) {
+            close_workspace_by_id(&state, &workspace_id);
+        }
+    });
+}
+
+fn request_pane_close_confirmation(state: &State, workspace_id: &str, pane_widget: &gtk::Widget) {
+    let window = state.borrow().window.clone();
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message("Close this pane?")
+        .detail("All terminals and running processes in this pane will be closed.")
+        .build();
+    dialog.set_buttons(&["Cancel", "Close Pane"]);
+    dialog.set_default_button(0);
+    dialog.set_cancel_button(0);
+
+    let state = state.clone();
+    let workspace_id = workspace_id.to_string();
+    let pane_widget = pane_widget.clone();
+    dialog.choose(Some(&window), None::<&gio::Cancellable>, move |response| {
+        if response.ok() == Some(1) {
+            remove_pane_internal(&state, &workspace_id, &pane_widget, true);
         }
     });
 }
@@ -5556,7 +5608,7 @@ fn close_focused_tab(state: &State) {
                 return;
             }
         }
-        remove_pane(state, &ws_id, &pane_widget);
+        request_pane_close_confirmation(state, &ws_id, &pane_widget);
     }
 }
 

@@ -207,6 +207,18 @@ pub struct TerminalHealth {
 }
 
 impl TerminalHandle {
+    pub fn close(&self) {
+        let Some(surface) = self.surface_cell.borrow_mut().take() else {
+            return;
+        };
+        SURFACE_MAP.with(|map| {
+            if let Some(entry) = map.borrow_mut().remove(&(surface as usize)) {
+                unsafe { drop(Box::from_raw(entry.clipboard_context)) };
+            }
+        });
+        unsafe { ghostty_surface_free(surface) };
+    }
+
     pub fn replace_callbacks(&self, callbacks: TerminalCallbacks) {
         *self.callbacks.borrow_mut() = callbacks;
     }

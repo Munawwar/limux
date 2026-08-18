@@ -175,6 +175,21 @@ pub fn find_pane_widget_by_id(pane_id: u32) -> Option<gtk::Widget> {
     lookup_pane_internals(pane_id).map(|internals| internals.pane_outer.clone().upcast())
 }
 
+pub fn close_processes(pane_widget: &gtk::Widget) {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return;
+    };
+    for entry in &internals.tab_state.borrow().tabs {
+        if let TabKind::Terminal { state } = &entry.kind {
+            state
+                .inner
+                .tree
+                .borrow()
+                .for_each_leaf(|leaf| leaf.handle.close());
+        }
+    }
+}
+
 pub fn set_workspace_dragging_all(active: bool) {
     PANE_REGISTRY.with(|registry| {
         for weak in registry.borrow().values() {
@@ -2759,7 +2774,7 @@ fn build_tab_button_from_label(
                 .iter()
                 .any(|entry| entry.id == tab_id && entry.pinned);
             if !is_pinned {
-                remove_tab(
+                request_tab_close_confirmation(
                     &tab_strip,
                     &content_stack,
                     &tab_state,
@@ -2846,7 +2861,7 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
         let menu_ref = menu.clone();
         close_btn.connect_clicked(move |_| {
             menu_ref.popdown();
-            remove_tab(
+            request_tab_close_confirmation(
                 &ts,
                 &cs,
                 &state,
@@ -3477,6 +3492,52 @@ fn activate_tab(
     }
 }
 
+fn request_tab_close_confirmation(
+    tab_strip: &gtk::Box,
+    content_stack: &gtk::Stack,
+    tab_state: &Rc<RefCell<TabState>>,
+    tab_id: &str,
+    callbacks: &Rc<PaneCallbacks>,
+    pane_outer: &gtk::Box,
+    empty_reason: PaneEmptyReason,
+) {
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message("Close this tab?")
+        .detail("Any running process or unsaved page state in this tab will be lost.")
+        .build();
+    dialog.set_buttons(&["Cancel", "Close Tab"]);
+    dialog.set_default_button(0);
+    dialog.set_cancel_button(0);
+
+    let tab_strip = tab_strip.clone();
+    let content_stack = content_stack.clone();
+    let tab_state = tab_state.clone();
+    let tab_id = tab_id.to_string();
+    let callbacks = callbacks.clone();
+    let pane_outer = pane_outer.clone();
+    let window = pane_outer
+        .root()
+        .and_then(|root| root.downcast::<gtk::Window>().ok());
+    dialog.choose(
+        window.as_ref(),
+        None::<&gtk::gio::Cancellable>,
+        move |response| {
+            if response.ok() == Some(1) {
+                remove_tab(
+                    &tab_strip,
+                    &content_stack,
+                    &tab_state,
+                    &tab_id,
+                    &callbacks,
+                    &pane_outer,
+                    empty_reason,
+                );
+            }
+        },
+    );
+}
+
 fn remove_tab(
     tab_strip: &gtk::Box,
     content_stack: &gtk::Stack,
@@ -3491,6 +3552,13 @@ fn remove_tab(
         return;
     };
     let entry = ts.tabs.remove(idx);
+    if let TabKind::Terminal { state } = &entry.kind {
+        state
+            .inner
+            .tree
+            .borrow()
+            .for_each_leaf(|leaf| leaf.handle.close());
+    }
 
     tab_strip.remove(&entry.tab_button);
     content_stack.remove(&entry.content);
